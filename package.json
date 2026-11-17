@@ -1,0 +1,24 @@
+{
+  "name": "fixmate-backend",
+  "version": "1.0.0",
+  "description": "fixmate",
+  "keywords": [
+    "fixmate"
+  ],
+  "license": "ISC",
+  "author": "sudipto roy",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "nodemon index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.10",
+    "express": "^5.3.0",
+    "jose": "^6.2.17",
+    "mongodb": "^7.9.0",
+    "nodemon": "^3.1.14"
+  }
+}
