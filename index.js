@@ -8,7 +8,21 @@ const app = express();
 
 const PORT = process.env.PORT || 8000;
 
-app.use(cors());
+const allowedOrigins = [
+  "http://localhost:3000",
+  "https://fixmate-frontend-five.vercel.app",
+];
+
+app.use(
+  cors({
+    origin: allowedOrigins,
+    methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+
+
+
 app.use(express.json());
 
 const mongoUri = process.env.MONGODB_URI;
