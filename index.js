@@ -999,6 +999,33 @@ app.get("/api/services/:id", async (req, res) => {
   }
 });
 
+// Get latest 6 featured services
+app.get("/api/featured-services", async (req, res) => {
+  try {
+    const featuredServices = await services
+      .find({
+        approvalStatus: "approved",
+        isAvailable: true,
+      })
+      .sort({ createdAt: -1 })
+      .limit(6)
+      .toArray();
+
+    res.status(200).send({
+      success: true,
+      message: "Featured services fetched successfully.",
+      data: featuredServices,
+    });
+  } catch (error) {
+    console.error("Error fetching featured services:", error);
+
+    res.status(500).send({
+      success: false,
+      message: "Failed to fetch featured services.",
+    });
+  }
+});
+
 
 app.get("/", (req, res) => {
   res.send({ message: "Welcome to FixMate!" });
