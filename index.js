@@ -18,10 +18,8 @@ app.use(
     origin: allowedOrigins,
     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
-  })
+  }),
 );
-
-
 
 app.use(express.json());
 
@@ -30,13 +28,13 @@ const mongoUri = process.env.MONGODB_URI;
 const client = new MongoClient(mongoUri);
 
 export async function connectToMongoDB() {
-    try {
-        await client.connect();
-        console.log("You successfully connected to MongoDB!");
-        return client;
-    } catch (err) {
-        console.dir(err);
-    }
+  try {
+    await client.connect();
+    console.log("You successfully connected to MongoDB!");
+    return client;
+  } catch (err) {
+    console.dir(err);
+  }
 }
 const connectedClient = await connectToMongoDB();
 const database = connectedClient.db("fixmate");
@@ -46,10 +44,8 @@ const payments = database.collection("payments");
 const services = database.collection("services");
 const serviceRequests = database.collection("serviceRequests");
 
-
-
 const JWKS = createRemoteJWKSet(
-  new URL(`${process.env.CLIENT_URL}/api/auth/jwks`)
+  new URL(`${process.env.CLIENT_URL}/api/auth/jwks`),
 );
 
 const verifyToken = async (req, res, next) => {
@@ -81,37 +77,30 @@ const verifyToken = async (req, res, next) => {
 
 // must call this middleware after verifyToken
 const verifyCustomer = async (req, res, next) => {
-    if (req.user.role !== 'customer') {
-        res.status(403).send({ message: 'Forbidden' });
-        return;
-    }
-    next();
-}
+  if (req.user.role !== "customer") {
+    res.status(403).send({ message: "Forbidden" });
+    return;
+  }
+  next();
+};
 
 const verifyTechnician = async (req, res, next) => {
-    if (req.user.role !== 'technician') {
-        res.status(403).send({ message: 'Forbidden' });
-        return;
-    }
-    next();
-}
+  if (req.user.role !== "technician") {
+    res.status(403).send({ message: "Forbidden" });
+    return;
+  }
+  next();
+};
 
 const verifyAdmin = async (req, res, next) => {
-    if (req.user.role !== 'admin') {
-        res.status(403).send({ message: 'Forbidden' });
-        return;
-    }
-    next();
-}
+  if (req.user.role !== "admin") {
+    res.status(403).send({ message: "Forbidden" });
+    return;
+  }
+  next();
+};
 
 
-
-// users related apis
-app.get('/users', async (req, res) => {
-    const cursor = users.find({});
-    const result = await cursor.toArray();
-    res.send(result);
-})
 
 // Services related APIs
 
@@ -155,10 +144,7 @@ app.post("/api/services", verifyToken, verifyTechnician, async (req, res) => {
       "Electrical",
     ];
 
-    const allowedServiceModes = [
-      "Home Visit",
-      "Shop Drop-off",
-    ];
+    const allowedServiceModes = ["Home Visit", "Shop Drop-off"];
 
     if (!allowedCategories.includes(category)) {
       return res.status(400).send({
@@ -233,37 +219,41 @@ app.post("/api/services", verifyToken, verifyTechnician, async (req, res) => {
 });
 
 // Get services created by the logged-in technician
-app.get("/api/services/my-services", verifyToken, verifyTechnician, async (req, res) => {
-  try {
-    const technicianEmail = req.user.email;
+app.get(
+  "/api/services/my-services",
+  verifyToken,
+  verifyTechnician,
+  async (req, res) => {
+    try {
+      const technicianEmail = req.user.email;
 
-    if (!technicianEmail) {
-      return res.status(401).send({
+      if (!technicianEmail) {
+        return res.status(401).send({
+          success: false,
+          message: "Technician email not found in token.",
+        });
+      }
+
+      const result = await services
+        .find({ technicianEmail })
+        .sort({ createdAt: -1 })
+        .toArray();
+
+      res.status(200).send({
+        success: true,
+        message: "Your services retrieved successfully!",
+        data: result,
+      });
+    } catch (error) {
+      console.error("Get my services error:", error);
+
+      res.status(500).send({
         success: false,
-        message: "Technician email not found in token.",
+        message: "Failed to retrieve your services.",
       });
     }
-
-    const result = await services
-      .find({ technicianEmail })
-      .sort({ createdAt: -1 })
-      .toArray();
-
-    res.status(200).send({
-      success: true,
-      message: "Your services retrieved successfully!",
-      data: result,
-    });
-  } catch (error) {
-    console.error("Get my services error:", error);
-
-    res.status(500).send({
-      success: false,
-      message: "Failed to retrieve your services.",
-    });
-  }
-});
-
+  },
+);
 
 app.post(
   "/api/service-requests",
@@ -374,10 +364,8 @@ app.post(
         message: "Failed to submit service request.",
       });
     }
-  }
+  },
 );
-
-
 
 app.get(
   "/api/service-requests/technician",
@@ -405,9 +393,8 @@ app.get(
         message: "Failed to retrieve service requests.",
       });
     }
-  }
+  },
 );
-
 
 app.patch(
   "/api/service-requests/:id/status",
@@ -463,20 +450,14 @@ app.patch(
       }
 
       // Validate job progress
-      if (
-        status === "in-progress" &&
-        existingRequest.status !== "accepted"
-      ) {
+      if (status === "in-progress" && existingRequest.status !== "accepted") {
         return res.status(400).send({
           success: false,
           message: "Only accepted requests can be started.",
         });
       }
 
-      if (
-        status === "completed" &&
-        existingRequest.status !== "in-progress"
-      ) {
+      if (status === "completed" && existingRequest.status !== "in-progress") {
         return res.status(400).send({
           success: false,
           message: "Only ongoing jobs can be completed.",
@@ -494,7 +475,7 @@ app.patch(
             status,
             updatedAt: new Date(),
           },
-        }
+        },
       );
 
       if (!result.modifiedCount) {
@@ -516,9 +497,8 @@ app.patch(
         message: "Failed to update request status.",
       });
     }
-  }
+  },
 );
-
 
 // api for customer
 
@@ -549,9 +529,8 @@ app.get(
         message: "Failed to retrieve customer bookings.",
       });
     }
-  }
+  },
 );
-
 
 // Get logged-in customer's payment history
 app.get(
@@ -580,10 +559,261 @@ app.get(
         message: "Failed to retrieve payment history.",
       });
     }
-  }
+  },
 );
 
+// ========================================
+// ADMIN DASHBOARD APIs
+// All routes require a valid admin JWT
+// ========================================
 
+// 1. Admin dashboard overview
+app.get("/api/admin/overview", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const [
+      totalUsers,
+      totalTechnicians,
+      totalCustomers,
+      totalServices,
+      pendingServices,
+      approvedServices,
+      rejectedServices,
+      totalBookings,
+      pendingBookings,
+      completedBookings,
+      totalTransactions,
+    ] = await Promise.all([
+      users.countDocuments({}),
+      users.countDocuments({ role: "technician" }),
+      users.countDocuments({ role: "customer" }),
+
+      services.countDocuments({}),
+      services.countDocuments({ approvalStatus: "pending" }),
+      services.countDocuments({ approvalStatus: "approved" }),
+      services.countDocuments({ approvalStatus: "rejected" }),
+
+      serviceRequests.countDocuments({}),
+      serviceRequests.countDocuments({ status: "pending" }),
+      serviceRequests.countDocuments({ status: "completed" }),
+
+      payments.countDocuments({}),
+    ]);
+
+    res.status(200).json({
+      success: true,
+      message: "Admin dashboard overview retrieved successfully.",
+      data: {
+        totalUsers,
+        totalTechnicians,
+        totalCustomers,
+        totalServices,
+        pendingServices,
+        approvedServices,
+        rejectedServices,
+        totalBookings,
+        pendingBookings,
+        completedBookings,
+        totalTransactions,
+      },
+    });
+  } catch (error) {
+    console.error("Admin overview error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to retrieve admin dashboard overview.",
+    });
+  }
+});
+
+// 2. Get all users
+app.get("/api/admin/users", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const result = await users.find({}).sort({ createdAt: -1 }).toArray();
+
+    res.status(200).json({
+      success: true,
+      message: "Users retrieved successfully.",
+      data: result,
+    });
+  } catch (error) {
+    console.error("Admin users error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to retrieve users.",
+    });
+  }
+});
+
+// 3. Get all services
+app.get("/api/admin/services", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const result = await services.find({}).sort({ createdAt: -1 }).toArray();
+
+    res.status(200).json({
+      success: true,
+      message: "Services retrieved successfully.",
+      data: result,
+    });
+  } catch (error) {
+    console.error("Admin services error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to retrieve services.",
+    });
+  }
+});
+
+// 4. Approve or reject a service
+app.patch(
+  "/api/admin/services/:id/approval",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { approvalStatus } = req.body;
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid service ID.",
+        });
+      }
+
+      if (!["approved", "rejected"].includes(approvalStatus)) {
+        return res.status(400).json({
+          success: false,
+          message: "Approval status must be approved or rejected.",
+        });
+      }
+
+      const result = await services.updateOne(
+        {
+          _id: new ObjectId(id),
+          approvalStatus: "pending",
+        },
+        {
+          $set: {
+            approvalStatus,
+            reviewedAt: new Date(),
+          },
+        },
+      );
+
+      if (!result.matchedCount) {
+        return res.status(404).json({
+          success: false,
+          message: "Pending service not found.",
+        });
+      }
+
+      res.status(200).json({
+        success: true,
+        message: `Service ${approvalStatus} successfully.`,
+      });
+    } catch (error) {
+      console.error("Service approval error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to update service approval.",
+      });
+    }
+  },
+);
+
+// 5. Delete a service
+app.delete(
+  "/api/admin/services/:id",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid service ID.",
+        });
+      }
+
+      const result = await services.deleteOne({
+        _id: new ObjectId(id),
+      });
+
+      if (!result.deletedCount) {
+        return res.status(404).json({
+          success: false,
+          message: "Service not found.",
+        });
+      }
+
+      res.status(200).json({
+        success: true,
+        message: "Service deleted successfully.",
+      });
+    } catch (error) {
+      console.error("Delete service error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to delete service.",
+      });
+    }
+  },
+);
+
+// 6. Get all bookings
+app.get("/api/admin/bookings", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const result = await serviceRequests
+      .find({})
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json({
+      success: true,
+      message: "Bookings retrieved successfully.",
+      data: result,
+    });
+  } catch (error) {
+    console.error("Admin bookings error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to retrieve bookings.",
+    });
+  }
+});
+
+// 7. Get all transactions
+app.get(
+  "/api/admin/transactions",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const result = await payments.find({}).sort({ createdAt: -1 }).toArray();
+
+      res.status(200).json({
+        success: true,
+        message: "Transactions retrieved successfully.",
+        data: result,
+      });
+    } catch (error) {
+      console.error("Admin transactions error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to retrieve transactions.",
+      });
+    }
+  },
+);
 
 app.get("/", (req, res) => {
   res.send({ message: "Welcome to FixMate!" });
