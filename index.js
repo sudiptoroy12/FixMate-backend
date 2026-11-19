@@ -1,7 +1,7 @@
 import express from "express";
 import "dotenv/config";
 import cors from "cors";
-import { MongoClient } from "mongodb";
+import { MongoClient, ObjectId } from "mongodb";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 
 const app = express();
@@ -44,6 +44,8 @@ const users = database.collection("users");
 const sessions = database.collection("sessions");
 const payments = database.collection("payments");
 const services = database.collection("services");
+const serviceRequests = database.collection("serviceRequests");
+
 
 
 const JWKS = createRemoteJWKSet(
@@ -261,6 +263,325 @@ app.get("/api/services/my-services", verifyToken, verifyTechnician, async (req, 
     });
   }
 });
+
+
+app.post(
+  "/api/service-requests",
+  verifyToken,
+  verifyCustomer,
+  async (req, res) => {
+    try {
+      const {
+        serviceId,
+        deviceName,
+        problemDescription,
+        customerPhone,
+        address,
+        preferredDate,
+        preferredTime,
+      } = req.body;
+
+      if (
+        !serviceId ||
+        !deviceName ||
+        !problemDescription ||
+        !customerPhone ||
+        !address ||
+        !preferredDate ||
+        !preferredTime
+      ) {
+        return res.status(400).send({
+          success: false,
+          message: "Please provide all required fields.",
+        });
+      }
+
+      if (!ObjectId.isValid(serviceId)) {
+        return res.status(400).send({
+          success: false,
+          message: "Invalid service ID.",
+        });
+      }
+
+      // Find the selected service
+      const service = await services.findOne({
+        _id: new ObjectId(serviceId),
+        approvalStatus: "approved",
+        isAvailable: true,
+      });
+
+      if (!service) {
+        return res.status(404).send({
+          success: false,
+          message: "Service not found or unavailable.",
+        });
+      }
+
+      // Get customer information from verified token
+      const customerEmail = req.user.email;
+      const customerName = req.user.name;
+
+      if (!customerEmail || !customerName) {
+        return res.status(401).send({
+          success: false,
+          message: "Customer information missing.",
+        });
+      }
+
+      const newRequest = {
+        serviceId: service._id,
+
+        serviceTitle: service.title,
+        serviceCategory: service.category,
+        servicePrice: service.basePrice,
+        serviceImage: service.image,
+
+        technicianName: service.technicianName,
+        technicianEmail: service.technicianEmail,
+
+        customerName,
+        customerEmail,
+        customerPhone,
+
+        deviceName: String(deviceName).trim(),
+        problemDescription: String(problemDescription).trim(),
+
+        address: String(address).trim(),
+        preferredDate,
+        preferredTime,
+
+        status: "pending",
+
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const result = await serviceRequests.insertOne(newRequest);
+
+      res.status(201).send({
+        success: true,
+        message: "Service request submitted successfully!",
+        data: {
+          _id: result.insertedId,
+          ...newRequest,
+        },
+      });
+    } catch (error) {
+      console.error("Create service request error:", error);
+
+      res.status(500).send({
+        success: false,
+        message: "Failed to submit service request.",
+      });
+    }
+  }
+);
+
+
+
+app.get(
+  "/api/service-requests/technician",
+  verifyToken,
+  verifyTechnician,
+  async (req, res) => {
+    try {
+      const technicianEmail = req.user.email;
+
+      const result = await serviceRequests
+        .find({ technicianEmail })
+        .sort({ createdAt: -1 })
+        .toArray();
+
+      res.status(200).send({
+        success: true,
+        message: "Service requests retrieved successfully!",
+        data: result,
+      });
+    } catch (error) {
+      console.error("Get technician requests error:", error);
+
+      res.status(500).send({
+        success: false,
+        message: "Failed to retrieve service requests.",
+      });
+    }
+  }
+);
+
+
+app.patch(
+  "/api/service-requests/:id/status",
+  verifyToken,
+  verifyTechnician,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { status } = req.body;
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).send({
+          success: false,
+          message: "Invalid request ID.",
+        });
+      }
+
+      const allowedStatuses = [
+        "accepted",
+        "rejected",
+        "in-progress",
+        "completed",
+      ];
+
+      if (!allowedStatuses.includes(status)) {
+        return res.status(400).send({
+          success: false,
+          message: "Invalid request status.",
+        });
+      }
+
+      const existingRequest = await serviceRequests.findOne({
+        _id: new ObjectId(id),
+        technicianEmail: req.user.email,
+      });
+
+      if (!existingRequest) {
+        return res.status(404).send({
+          success: false,
+          message: "Service request not found.",
+        });
+      }
+
+      // Only pending requests can be accepted or rejected.
+      if (
+        ["accepted", "rejected"].includes(status) &&
+        existingRequest.status !== "pending"
+      ) {
+        return res.status(400).send({
+          success: false,
+          message: "This request has already been processed.",
+        });
+      }
+
+      // Validate job progress
+      if (
+        status === "in-progress" &&
+        existingRequest.status !== "accepted"
+      ) {
+        return res.status(400).send({
+          success: false,
+          message: "Only accepted requests can be started.",
+        });
+      }
+
+      if (
+        status === "completed" &&
+        existingRequest.status !== "in-progress"
+      ) {
+        return res.status(400).send({
+          success: false,
+          message: "Only ongoing jobs can be completed.",
+        });
+      }
+
+      const result = await serviceRequests.updateOne(
+        {
+          _id: new ObjectId(id),
+          technicianEmail: req.user.email,
+          status: existingRequest.status,
+        },
+        {
+          $set: {
+            status,
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      if (!result.modifiedCount) {
+        return res.status(409).send({
+          success: false,
+          message: "Request status changed. Please refresh.",
+        });
+      }
+
+      res.status(200).send({
+        success: true,
+        message: `Request ${status} successfully!`,
+      });
+    } catch (error) {
+      console.error("Update request status error:", error);
+
+      res.status(500).send({
+        success: false,
+        message: "Failed to update request status.",
+      });
+    }
+  }
+);
+
+
+// api for customer
+
+// Get logged-in customer's bookings
+app.get(
+  "/api/service-requests/customer",
+  verifyToken,
+  verifyCustomer,
+  async (req, res) => {
+    try {
+      const customerEmail = req.user.email;
+
+      const bookings = await serviceRequests
+        .find({ customerEmail })
+        .sort({ createdAt: -1 })
+        .toArray();
+
+      res.status(200).json({
+        success: true,
+        message: "Customer bookings retrieved successfully.",
+        data: bookings,
+      });
+    } catch (error) {
+      console.error("Customer bookings error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to retrieve customer bookings.",
+      });
+    }
+  }
+);
+
+
+// Get logged-in customer's payment history
+app.get(
+  "/api/payments/customer",
+  verifyToken,
+  verifyCustomer,
+  async (req, res) => {
+    try {
+      const customerEmail = req.user.email;
+
+      const paymentHistory = await payments
+        .find({ customerEmail })
+        .sort({ createdAt: -1 })
+        .toArray();
+
+      res.status(200).json({
+        success: true,
+        message: "Payment history retrieved successfully.",
+        data: paymentHistory,
+      });
+    } catch (error) {
+      console.error("Customer payments error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to retrieve payment history.",
+      });
+    }
+  }
+);
 
 
 
