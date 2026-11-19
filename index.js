@@ -255,118 +255,6 @@ app.get(
   },
 );
 
-app.post(
-  "/api/service-requests",
-  verifyToken,
-  verifyCustomer,
-  async (req, res) => {
-    try {
-      const {
-        serviceId,
-        deviceName,
-        problemDescription,
-        customerPhone,
-        address,
-        preferredDate,
-        preferredTime,
-      } = req.body;
-
-      if (
-        !serviceId ||
-        !deviceName ||
-        !problemDescription ||
-        !customerPhone ||
-        !address ||
-        !preferredDate ||
-        !preferredTime
-      ) {
-        return res.status(400).send({
-          success: false,
-          message: "Please provide all required fields.",
-        });
-      }
-
-      if (!ObjectId.isValid(serviceId)) {
-        return res.status(400).send({
-          success: false,
-          message: "Invalid service ID.",
-        });
-      }
-
-      // Find the selected service
-      const service = await services.findOne({
-        _id: new ObjectId(serviceId),
-        approvalStatus: "approved",
-        isAvailable: true,
-      });
-
-      if (!service) {
-        return res.status(404).send({
-          success: false,
-          message: "Service not found or unavailable.",
-        });
-      }
-
-      // Get customer information from verified token
-      const customerEmail = req.user.email;
-      const customerName = req.user.name;
-
-      if (!customerEmail || !customerName) {
-        return res.status(401).send({
-          success: false,
-          message: "Customer information missing.",
-        });
-      }
-
-      const newRequest = {
-        serviceId: service._id,
-
-        serviceTitle: service.title,
-        serviceCategory: service.category,
-        servicePrice: service.basePrice,
-        serviceImage: service.image,
-
-        technicianName: service.technicianName,
-        technicianEmail: service.technicianEmail,
-
-        customerName,
-        customerEmail,
-        customerPhone,
-
-        deviceName: String(deviceName).trim(),
-        problemDescription: String(problemDescription).trim(),
-
-        address: String(address).trim(),
-        preferredDate,
-        preferredTime,
-
-        status: "pending",
-
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
-
-      const result = await serviceRequests.insertOne(newRequest);
-
-      res.status(201).send({
-        success: true,
-        message: "Service request submitted successfully!",
-        data: {
-          _id: result.insertedId,
-          ...newRequest,
-        },
-      });
-    } catch (error) {
-      console.error("Create service request error:", error);
-
-      res.status(500).send({
-        success: false,
-        message: "Failed to submit service request.",
-      });
-    }
-  },
-);
-
 app.get(
   "/api/service-requests/technician",
   verifyToken,
@@ -395,6 +283,7 @@ app.get(
     }
   },
 );
+
 
 app.patch(
   "/api/service-requests/:id/status",
@@ -438,10 +327,10 @@ app.patch(
         });
       }
 
-      // Only pending requests can be accepted or rejected.
+      // Only requested requests can be accepted or rejected.
       if (
         ["accepted", "rejected"].includes(status) &&
-        existingRequest.status !== "pending"
+        existingRequest.status !== "requested"
       ) {
         return res.status(400).send({
           success: false,
@@ -449,15 +338,22 @@ app.patch(
         });
       }
 
-      // Validate job progress
-      if (status === "in-progress" && existingRequest.status !== "accepted") {
+      // Only accepted requests can be started.
+      if (
+        status === "in-progress" &&
+        existingRequest.status !== "accepted"
+      ) {
         return res.status(400).send({
           success: false,
           message: "Only accepted requests can be started.",
         });
       }
 
-      if (status === "completed" && existingRequest.status !== "in-progress") {
+      // Only ongoing jobs can be completed.
+      if (
+        status === "completed" &&
+        existingRequest.status !== "in-progress"
+      ) {
         return res.status(400).send({
           success: false,
           message: "Only ongoing jobs can be completed.",
@@ -475,7 +371,7 @@ app.patch(
             status,
             updatedAt: new Date(),
           },
-        },
+        }
       );
 
       if (!result.modifiedCount) {
@@ -485,24 +381,216 @@ app.patch(
         });
       }
 
-      res.status(200).send({
+      return res.status(200).send({
         success: true,
         message: `Request ${status} successfully!`,
       });
     } catch (error) {
       console.error("Update request status error:", error);
 
-      res.status(500).send({
+      return res.status(500).send({
         success: false,
         message: "Failed to update request status.",
       });
     }
-  },
+  }
 );
+
 
 // api for customer
 
+//service request APIs for customer
+
+
+
+app.post(
+  "/api/service-requests",
+  verifyToken,
+  verifyCustomer,
+  async (req, res) => {
+    try {
+      const {
+        serviceId,
+        problemDescription,
+        customerPhone,
+        address,
+        preferredDate,
+      } = req.body;
+
+      // Validate required fields
+      if (
+        !serviceId ||
+        !problemDescription ||
+        !customerPhone ||
+        !address ||
+        !preferredDate
+      ) {
+        return res.status(400).send({
+          success: false,
+          message: "Please provide all required fields.",
+        });
+      }
+
+      // Validate service ID
+      if (!ObjectId.isValid(serviceId)) {
+        return res.status(400).send({
+          success: false,
+          message: "Invalid service ID.",
+        });
+      }
+
+      // Trim input values
+      const trimmedProblem = String(problemDescription).trim();
+      const trimmedPhone = String(customerPhone).trim();
+      const trimmedAddress = String(address).trim();
+
+      if (trimmedProblem.length < 20) {
+        return res.status(400).send({
+          success: false,
+          message: "Problem description must be at least 20 characters.",
+        });
+      }
+
+      if (!trimmedPhone || !trimmedAddress) {
+        return res.status(400).send({
+          success: false,
+          message: "Phone number and address cannot be empty.",
+        });
+      }
+
+      // Validate preferred date (YYYY-MM-DD)
+      const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+
+      if (
+        typeof preferredDate !== "string" ||
+        !datePattern.test(preferredDate)
+      ) {
+        return res.status(400).send({
+          success: false,
+          message: "Please provide a valid preferred date.",
+        });
+      }
+
+      const [year, month, day] = preferredDate.split("-").map(Number);
+
+      const selectedDate = new Date(year, month - 1, day);
+
+      // Check whether the calendar date actually exists
+      if (
+        selectedDate.getFullYear() !== year ||
+        selectedDate.getMonth() !== month - 1 ||
+        selectedDate.getDate() !== day
+      ) {
+        return res.status(400).send({
+          success: false,
+          message: "Please provide a valid preferred date.",
+        });
+      }
+
+      // Prevent past dates using server-local calendar date
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+
+      if (selectedDate < today) {
+        return res.status(400).send({
+          success: false,
+          message: "Preferred date cannot be in the past.",
+        });
+      }
+
+      // Find selected approved and available service
+      const service = await services.findOne({
+        _id: new ObjectId(serviceId),
+        approvalStatus: "approved",
+        isAvailable: true,
+      });
+
+      if (!service) {
+        return res.status(404).send({
+          success: false,
+          message: "Service not found or unavailable.",
+        });
+      }
+
+      // Get customer information from verified token
+      const customerEmail = req.user.email;
+      const customerName = req.user.name;
+
+      if (!customerEmail || !customerName) {
+        return res.status(401).send({
+          success: false,
+          message: "Customer information missing.",
+        });
+      }
+
+      // Prevent duplicate active requests
+      const activeRequest = await serviceRequests.findOne({
+        serviceId: service._id,
+        customerEmail,
+        status: {
+          $in: ["requested", "accepted", "in-progress"],
+        },
+      });
+
+      if (activeRequest) {
+        return res.status(409).send({
+          success: false,
+          message: "You already have an active request for this service.",
+        });
+      }
+
+      // Create new repair request
+      const newRequest = {
+        serviceId: service._id,
+
+        serviceTitle: service.title,
+        serviceCategory: service.category,
+        servicePrice: service.basePrice,
+        serviceImage: service.image,
+
+        technicianName: service.technicianName,
+        technicianEmail: service.technicianEmail,
+
+        customerName,
+        customerEmail,
+        customerPhone: trimmedPhone,
+
+        problemDescription: trimmedProblem,
+        address: trimmedAddress,
+        preferredDate,
+
+        status: "requested",
+        paymentStatus: "unpaid",
+
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const result = await serviceRequests.insertOne(newRequest);
+
+      return res.status(201).send({
+        success: true,
+        message: "Repair request submitted successfully!",
+        data: {
+          _id: result.insertedId,
+          ...newRequest,
+        },
+      });
+    } catch (error) {
+      console.error("Create service request error:", error);
+
+      return res.status(500).send({
+        success: false,
+        message: "Failed to submit repair request.",
+      });
+    }
+  }
+);
+
+
+
 // Get logged-in customer's bookings
+
 app.get(
   "/api/service-requests/customer",
   verifyToken,
@@ -516,21 +604,22 @@ app.get(
         .sort({ createdAt: -1 })
         .toArray();
 
-      res.status(200).json({
+      return res.status(200).json({
         success: true,
-        message: "Customer bookings retrieved successfully.",
+        message: "Customer repair requests retrieved successfully.",
         data: bookings,
       });
     } catch (error) {
-      console.error("Customer bookings error:", error);
+      console.error("Customer repair requests error:", error);
 
-      res.status(500).json({
+      return res.status(500).json({
         success: false,
-        message: "Failed to retrieve customer bookings.",
+        message: "Failed to retrieve customer repair requests.",
       });
     }
-  },
+  }
 );
+
 
 // Get logged-in customer's payment history
 app.get(
@@ -814,6 +903,102 @@ app.get(
     }
   },
 );
+
+
+// public service APIs
+app.get("/api/services", async (req, res) => {
+  try {
+    const result = await services
+      .find({
+        approvalStatus: "approved",
+        isAvailable: true,
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json({
+      success: true,
+      message: "Available services retrieved successfully.",
+      data: result,
+    });
+  } catch (error) {
+    console.error("Get services error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to retrieve services.",
+    });
+  }
+});
+// GET individual service details
+
+app.get("/api/services/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid service ID.",
+      });
+    }
+
+    const service = await services.findOne({
+      _id: new ObjectId(id),
+      approvalStatus: "approved",
+      isAvailable: true,
+    });
+
+    if (!service) {
+      return res.status(404).json({
+        success: false,
+        message: "Service not found or unavailable.",
+      });
+    }
+
+    // Get technician profile from users collection
+    const technician = await users.findOne(
+      {
+        email: service.technicianEmail,
+        role: "technician",
+      },
+      {
+        projection: {
+          name: 1,
+          email: 1,
+          image: 1,
+          area: 1,
+          bio: 1,
+        },
+      }
+    );
+
+    res.status(200).json({
+      success: true,
+      message: "Service details retrieved successfully.",
+      data: {
+        ...service,
+        technician: technician
+          ? {
+              name: technician.name,
+              email: technician.email,
+              image: technician.image,
+              area: technician.area,
+              bio: technician.bio,
+            }
+          : null,
+      },
+    });
+  } catch (error) {
+    console.error("Get service details error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to retrieve service details.",
+    });
+  }
+});
+
 
 app.get("/", (req, res) => {
   res.send({ message: "Welcome to FixMate!" });
