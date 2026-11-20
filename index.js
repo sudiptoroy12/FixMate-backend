@@ -3,6 +3,7 @@ import "dotenv/config";
 import cors from "cors";
 import { MongoClient, ObjectId } from "mongodb";
 import { createRemoteJWKSet, jwtVerify } from "jose";
+import Stripe from "stripe";
 
 const app = express();
 
@@ -52,6 +53,17 @@ const serviceRequests = database.collection("serviceRequests");
 
 const JWKS = createRemoteJWKSet(
   new URL(`${process.env.CLIENT_URL}/api/auth/jwks`),
+);
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+await payments.createIndex(
+  { stripeSessionId: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      stripeSessionId: { $type: "string" },
+    },
+  }
 );
 
 const verifyToken = async (req, res, next) => {
@@ -436,6 +448,7 @@ app.patch(
 
 
 
+
 // api for customer
 
 //service request APIs for customer
@@ -625,6 +638,65 @@ app.post(
     }
   }
 );
+
+// ========================================
+// CUSTOMER CANCEL SERVICE REQUEST
+// A customer can cancel only their own
+// request while its status is "requested".
+// ========================================
+
+app.patch(
+  "/api/service-requests/:id/cancel",
+  verifyToken,
+  verifyCustomer,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid booking ID.",
+        });
+      }
+
+      const result = await serviceRequests.updateOne(
+        {
+          _id: new ObjectId(id),
+          customerEmail: req.user.email,
+          status: "requested",
+        },
+        {
+          $set: {
+            status: "cancelled",
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      if (result.matchedCount === 0) {
+        return res.status(404).json({
+          success: false,
+          message:
+            "Request not found, or it can no longer be cancelled.",
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: "Repair request cancelled successfully.",
+      });
+    } catch (error) {
+      console.error("Cancel service request error:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Failed to cancel repair request.",
+      });
+    }
+  }
+);
+
 
 
 
@@ -1064,6 +1136,288 @@ app.get("/api/featured-services", async (req, res) => {
     });
   }
 });
+
+
+
+// ========================================
+// CREATE STRIPE CHECKOUT SESSION
+// Customer can pay only for their own
+// completed and unpaid repair request.
+// ========================================
+
+app.post(
+  "/api/payments/create-checkout-session",
+  verifyToken,
+  verifyCustomer,
+  async (req, res) => {
+    try {
+      const { bookingId } = req.body;
+
+      if (!bookingId || !ObjectId.isValid(bookingId)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid booking ID.",
+        });
+      }
+
+      const customerEmail = req.user.email;
+
+      const booking = await serviceRequests.findOne({
+        _id: new ObjectId(bookingId),
+        customerEmail,
+        status: "completed",
+        paymentStatus: "unpaid",
+      });
+
+      if (!booking) {
+        return res.status(404).json({
+          success: false,
+          message:
+            "Completed unpaid booking not found.",
+        });
+      }
+
+      const finalAmount = Number(booking.finalAmount);
+
+      if (!Number.isFinite(finalAmount) || finalAmount <= 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid final repair amount.",
+        });
+      }
+
+      // Reuse an existing open Checkout Session
+      if (booking.stripeSessionId) {
+        const existingSession = await stripe.checkout.sessions.retrieve(
+          booking.stripeSessionId
+        );
+
+        if (
+          existingSession.status === "open" &&
+          existingSession.url
+        ) {
+          return res.status(200).json({
+            success: true,
+            message: "Checkout session retrieved successfully.",
+            url: existingSession.url,
+          });
+        }
+      }
+
+      const frontendUrl = process.env.CLIENT_URL.replace(/\/$/, "");
+
+      // Create a new Stripe Checkout Session
+      const session = await stripe.checkout.sessions.create({
+        mode: "payment",
+
+       
+
+        customer_email: booking.customerEmail,
+
+        client_reference_id: booking._id.toString(),
+
+        line_items: [
+          {
+            price_data: {
+              currency: "bdt",
+              product_data: {
+                name: booking.serviceTitle || "FixMate Repair Service",
+                description: `Repair booking #${booking._id}`,
+              },
+              // BDT uses two decimal places.
+              unit_amount: Math.round(finalAmount * 100),
+            },
+            quantity: 1,
+          },
+        ],
+
+        metadata: {
+          bookingId: booking._id.toString(),
+          customerEmail: booking.customerEmail,
+        },
+
+        success_url:
+          `${frontendUrl}/dashboard/customer/payments?payment=success&session_id={CHECKOUT_SESSION_ID}`,
+
+        cancel_url:
+          `${frontendUrl}/dashboard/customer/bookings?payment=cancelled`,
+      });
+
+      // Save the Checkout Session ID with the booking
+      await serviceRequests.updateOne(
+        {
+          _id: booking._id,
+          customerEmail,
+          status: "completed",
+          paymentStatus: "unpaid",
+        },
+        {
+          $set: {
+            stripeSessionId: session.id,
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      return res.status(200).json({
+        success: true,
+        message: "Checkout session created successfully.",
+        url: session.url,
+      });
+    } catch (error) {
+      console.error("Create Stripe session error:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Unable to create payment session.",
+      });
+    }
+  }
+);
+
+
+
+
+
+app.post(
+  "/api/payments/verify-session",
+  verifyToken,
+  verifyCustomer,
+  async (req, res) => {
+    try {
+      const { sessionId } = req.body;
+      const customerEmail = req.user.email;
+
+      if (!sessionId || typeof sessionId !== "string") {
+        return res.status(400).json({
+          success: false,
+          message: "Session ID is required.",
+        });
+      }
+
+      // Retrieve the session directly from Stripe
+      const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+      if (
+        session.status !== "complete" ||
+        session.payment_status !== "paid" ||
+        session.mode !== "payment"
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Payment has not been completed.",
+        });
+      }
+
+      const bookingId = session.metadata?.bookingId;
+
+      if (
+        !bookingId ||
+        !ObjectId.isValid(bookingId) ||
+        session.metadata?.customerEmail !== customerEmail
+      ) {
+        return res.status(403).json({
+          success: false,
+          message: "Invalid payment session.",
+        });
+      }
+
+      const booking = await serviceRequests.findOne({
+        _id: new ObjectId(bookingId),
+        customerEmail,
+        status: "completed",
+        stripeSessionId: session.id,
+      });
+
+      if (!booking) {
+        return res.status(404).json({
+          success: false,
+          message: "Booking not found for this payment.",
+        });
+      }
+
+      const expectedAmount = Math.round(
+        Number(booking.finalAmount) * 100
+      );
+
+      if (
+        !Number.isFinite(expectedAmount) ||
+        session.amount_total !== expectedAmount ||
+        session.currency !== "bdt"
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Payment amount or currency does not match.",
+        });
+      }
+
+      const paidAt = session.created
+        ? new Date(session.created * 1000)
+        : new Date();
+
+      const transactionId =
+        typeof session.payment_intent === "string"
+          ? session.payment_intent
+          : session.payment_intent?.id || session.id;
+
+      // Insert a payment record only once per Stripe session
+      await payments.updateOne(
+        { stripeSessionId: session.id },
+        {
+          $setOnInsert: {
+            bookingId: booking._id.toString(),
+            serviceTitle: booking.serviceTitle,
+            customerName: booking.customerName,
+            customerEmail: booking.customerEmail,
+            technicianName: booking.technicianName,
+            technicianEmail: booking.technicianEmail,
+            amount: Number(booking.finalAmount),
+            currency: "BDT",
+            transactionId,
+            stripeSessionId: session.id,
+            paymentStatus: "paid",
+            paymentMethod: "Card",
+            paidAt,
+            createdAt: new Date(),
+          },
+        },
+        { upsert: true }
+      );
+
+      // Update booking payment status
+      await serviceRequests.updateOne(
+        {
+          _id: booking._id,
+          customerEmail,
+          stripeSessionId: session.id,
+          paymentStatus: { $ne: "paid" },
+        },
+        {
+          $set: {
+            paymentStatus: "paid",
+            paidAt,
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      return res.status(200).json({
+        success: true,
+        message: "Payment verified successfully.",
+        bookingId: booking._id.toString(),
+      });
+    } catch (error) {
+      console.error("Payment verification error:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Unable to verify payment.",
+      });
+    }
+  }
+);
+
+
 
 
 app.get("/", (req, res) => {
