@@ -21,7 +21,13 @@ app.use(
   }),
 );
 
+app.use(
+  "/api/payments/webhook",
+  express.raw({ type: "application/json" })
+);
+
 app.use(express.json());
+
 
 const mongoUri = process.env.MONGODB_URI;
 
@@ -285,6 +291,8 @@ app.get(
 );
 
 
+
+
 app.patch(
   "/api/service-requests/:id/status",
   verifyToken,
@@ -292,8 +300,9 @@ app.patch(
   async (req, res) => {
     try {
       const { id } = req.params;
-      const { status } = req.body;
+      const { status, finalAmount } = req.body;
 
+      // Validate request ID
       if (!ObjectId.isValid(id)) {
         return res.status(400).send({
           success: false,
@@ -301,6 +310,7 @@ app.patch(
         });
       }
 
+      // Allowed statuses
       const allowedStatuses = [
         "accepted",
         "rejected",
@@ -315,6 +325,23 @@ app.patch(
         });
       }
 
+      // Validate final amount when completing
+      if (status === "completed") {
+        if (
+          finalAmount === undefined ||
+          finalAmount === null ||
+          finalAmount === "" ||
+          !Number.isFinite(Number(finalAmount)) ||
+          Number(finalAmount) <= 0
+        ) {
+          return res.status(400).send({
+            success: false,
+            message: "Please provide a valid final amount.",
+          });
+        }
+      }
+
+      // Find request belonging to this technician
       const existingRequest = await serviceRequests.findOne({
         _id: new ObjectId(id),
         technicianEmail: req.user.email,
@@ -327,7 +354,7 @@ app.patch(
         });
       }
 
-      // Only requested requests can be accepted or rejected.
+      // Only requested requests can be accepted or rejected
       if (
         ["accepted", "rejected"].includes(status) &&
         existingRequest.status !== "requested"
@@ -338,7 +365,7 @@ app.patch(
         });
       }
 
-      // Only accepted requests can be started.
+      // Only accepted requests can be started
       if (
         status === "in-progress" &&
         existingRequest.status !== "accepted"
@@ -349,7 +376,7 @@ app.patch(
         });
       }
 
-      // Only ongoing jobs can be completed.
+      // Only ongoing jobs can be completed
       if (
         status === "completed" &&
         existingRequest.status !== "in-progress"
@@ -360,6 +387,19 @@ app.patch(
         });
       }
 
+      // Prepare update fields
+      const updateFields = {
+        status,
+        updatedAt: new Date(),
+      };
+
+      // Save final amount when completing
+      if (status === "completed") {
+        updateFields.finalAmount = Number(finalAmount);
+        updateFields.paymentStatus = "unpaid";
+      }
+
+      // Update request
       const result = await serviceRequests.updateOne(
         {
           _id: new ObjectId(id),
@@ -367,10 +407,7 @@ app.patch(
           status: existingRequest.status,
         },
         {
-          $set: {
-            status,
-            updatedAt: new Date(),
-          },
+          $set: updateFields,
         }
       );
 
@@ -395,6 +432,8 @@ app.patch(
     }
   }
 );
+
+
 
 
 // api for customer
