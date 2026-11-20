@@ -22,10 +22,6 @@ app.use(
   }),
 );
 
-app.use(
-  "/api/payments/webhook",
-  express.raw({ type: "application/json" })
-);
 
 app.use(express.json());
 
