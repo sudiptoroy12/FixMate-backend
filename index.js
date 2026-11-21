@@ -1,3 +1,4 @@
+
 import express from "express";
 import "dotenv/config";
 import cors from "cors";
@@ -19,14 +20,20 @@ app.use(
     origin: allowedOrigins,
     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
-  }),
+  })
 );
-
 
 app.use(express.json());
 
+// ========================================
+// DATABASE CONNECTION
+// ========================================
 
 const mongoUri = process.env.MONGODB_URI;
+
+if (!mongoUri) {
+  throw new Error("MONGODB_URI is not configured.");
+}
 
 const client = new MongoClient(mongoUri);
 
@@ -36,22 +43,62 @@ export async function connectToMongoDB() {
     console.log("You successfully connected to MongoDB!");
     return client;
   } catch (err) {
-    console.dir(err);
+    console.error("MongoDB connection error:", err);
+    throw err;
   }
 }
+
 const connectedClient = await connectToMongoDB();
+
 const database = connectedClient.db("fixmate");
+
 const users = database.collection("users");
 const sessions = database.collection("sessions");
 const payments = database.collection("payments");
 const services = database.collection("services");
 const serviceRequests = database.collection("serviceRequests");
 
-const JWKS = createRemoteJWKSet(
-  new URL(`${process.env.CLIENT_URL}/api/auth/jwks`),
-);
+// ========================================
+// STRIPE CONFIGURATION
+// ========================================
+
+if (!process.env.STRIPE_SECRET_KEY) {
+  throw new Error("STRIPE_SECRET_KEY is not configured.");
+}
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+// FixMate uses USD for all new services and payments.
+const CURRENCY = "usd";
+const DATABASE_CURRENCY = "USD";
+
+// Minimum service and payment amount: $1.00
+const MIN_PRICE_CENTS = 100;
+const MAX_PRICE_CENTS = 99999999;
+
+// Convert USD to Stripe cents.
+// Example: $10.50 = 1050 cents.
+const toUsdCents = (value) => {
+  const amount = Number(value);
+
+  if (!Number.isFinite(amount)) {
+    return null;
+  }
+
+  const cents = Math.round(amount * 100);
+
+  if (
+    cents < MIN_PRICE_CENTS ||
+    cents > MAX_PRICE_CENTS ||
+    Math.abs(amount - cents / 100) > 0.000001
+  ) {
+    return null;
+  }
+
+  return cents;
+};
+
+// Create indexes
 await payments.createIndex(
   { stripeSessionId: 1 },
   {
@@ -60,6 +107,14 @@ await payments.createIndex(
       stripeSessionId: { $type: "string" },
     },
   }
+);
+
+// ========================================
+// AUTHENTICATION MIDDLEWARE
+// ========================================
+
+const JWKS = createRemoteJWKSet(
+  new URL(`${process.env.CLIENT_URL}/api/auth/jwks`)
 );
 
 const verifyToken = async (req, res, next) => {
@@ -89,150 +144,177 @@ const verifyToken = async (req, res, next) => {
   }
 };
 
-// must call this middleware after verifyToken
+// Customer authorization
 const verifyCustomer = async (req, res, next) => {
   if (req.user.role !== "customer") {
-    res.status(403).send({ message: "Forbidden" });
-    return;
+    return res.status(403).json({
+      success: false,
+      message: "Forbidden",
+    });
   }
+
   next();
 };
 
+// Technician authorization
 const verifyTechnician = async (req, res, next) => {
   if (req.user.role !== "technician") {
-    res.status(403).send({ message: "Forbidden" });
-    return;
+    return res.status(403).json({
+      success: false,
+      message: "Forbidden",
+    });
   }
+
   next();
 };
 
+// Admin authorization
 const verifyAdmin = async (req, res, next) => {
   if (req.user.role !== "admin") {
-    res.status(403).send({ message: "Forbidden" });
-    return;
+    return res.status(403).json({
+      success: false,
+      message: "Forbidden",
+    });
   }
+
   next();
 };
 
+// ========================================
+// TECHNICIAN SERVICE APIs
+// ========================================
 
+// Create new service
+app.post(
+  "/api/services",
+  verifyToken,
+  verifyTechnician,
+  async (req, res) => {
+    try {
+      const {
+        title,
+        category,
+        description,
+        image,
+        basePrice,
+        estimatedDuration,
+        serviceMode,
+        serviceArea,
+      } = req.body;
 
-// Services related APIs
+      // Validate required fields
+      if (
+        !title ||
+        !category ||
+        !description ||
+        !image ||
+        !estimatedDuration ||
+        !serviceMode ||
+        !serviceArea ||
+        basePrice === undefined ||
+        basePrice === null ||
+        basePrice === ""
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Please provide all required fields.",
+        });
+      }
 
-app.post("/api/services", verifyToken, verifyTechnician, async (req, res) => {
-  try {
-    const {
-      title,
-      category,
-      description,
-      image,
-      basePrice,
-      estimatedDuration,
-      serviceMode,
-      serviceArea,
-    } = req.body;
+      const allowedCategories = [
+        "Smartphone",
+        "Laptop & PC",
+        "AC",
+        "Refrigerator",
+        "TV",
+        "Washing Machine",
+        "Electrical",
+      ];
 
-    // Validate required fields
-    if (
-      !title ||
-      !category ||
-      !description ||
-      !image ||
-      !estimatedDuration ||
-      !serviceMode ||
-      !serviceArea ||
-      basePrice === undefined
-    ) {
-      return res.status(400).send({
+      const allowedServiceModes = [
+        "Home Visit",
+        "Shop Drop-off",
+      ];
+
+      if (!allowedCategories.includes(category)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid service category.",
+        });
+      }
+
+      if (!allowedServiceModes.includes(serviceMode)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid service mode.",
+        });
+      }
+
+      const priceCents = toUsdCents(basePrice);
+
+      if (priceCents === null) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Service price must be at least $1.00 USD and cannot have more than 2 decimal places.",
+        });
+      }
+
+      const price = priceCents / 100;
+
+      const technicianEmail = req.user.email;
+      const technicianName = req.user.name;
+
+      if (!technicianEmail || !technicianName) {
+        return res.status(401).json({
+          success: false,
+          message: "Technician information is missing from the token.",
+        });
+      }
+
+      const newService = {
+        title: String(title).trim(),
+        category,
+        description: String(description).trim(),
+        image: String(image).trim(),
+
+        basePrice: price,
+        currency: DATABASE_CURRENCY,
+
+        estimatedDuration: String(estimatedDuration).trim(),
+        serviceMode,
+        serviceArea: String(serviceArea).trim(),
+
+        technicianName,
+        technicianEmail,
+
+        approvalStatus: "pending",
+        isAvailable: true,
+        createdAt: new Date(),
+      };
+
+      const result = await services.insertOne(newService);
+
+      return res.status(201).json({
+        success: true,
+        message: "Service created successfully!",
+        data: {
+          _id: result.insertedId,
+          ...newService,
+        },
+      });
+    } catch (error) {
+      console.error("Create service error:", error);
+
+      return res.status(500).json({
         success: false,
-        message: "Please provide all required fields.",
+        message: "Failed to create service.",
       });
     }
-
-    const allowedCategories = [
-      "Smartphone",
-      "Laptop & PC",
-      "AC",
-      "Refrigerator",
-      "TV",
-      "Washing Machine",
-      "Electrical",
-    ];
-
-    const allowedServiceModes = ["Home Visit", "Shop Drop-off"];
-
-    if (!allowedCategories.includes(category)) {
-      return res.status(400).send({
-        success: false,
-        message: "Invalid service category.",
-      });
-    }
-
-    if (!allowedServiceModes.includes(serviceMode)) {
-      return res.status(400).send({
-        success: false,
-        message: "Invalid service mode.",
-      });
-    }
-
-    const price = Number(basePrice);
-
-    if (!Number.isFinite(price) || price <= 0) {
-      return res.status(400).send({
-        success: false,
-        message: "Please provide a valid service price.",
-      });
-    }
-
-    // Get technician information from verified JWT claims.
-    const technicianEmail = req.user.email;
-    const technicianName = req.user.name;
-
-    if (!technicianEmail || !technicianName) {
-      return res.status(401).send({
-        success: false,
-        message: "Technician information is missing from the token.",
-      });
-    }
-
-    const newService = {
-      title: String(title).trim(),
-      category,
-      description: String(description).trim(),
-      image: String(image).trim(),
-      basePrice: price,
-      estimatedDuration: String(estimatedDuration).trim(),
-      serviceMode,
-      serviceArea: String(serviceArea).trim(),
-
-      technicianName,
-      technicianEmail,
-
-      approvalStatus: "pending",
-      isAvailable: true,
-      createdAt: new Date(),
-    };
-
-    const result = await services.insertOne(newService);
-
-    res.status(201).send({
-      success: true,
-      message: "Service created successfully!",
-      data: {
-        _id: result.insertedId,
-        ...newService,
-      },
-    });
-  } catch (error) {
-    console.error("Create service error:", error);
-
-    res.status(500).send({
-      success: false,
-      message: "Failed to create service.",
-    });
   }
-});
+);
 
-// Get services created by the logged-in technician
+// Get services created by logged-in technician
 app.get(
   "/api/services/my-services",
   verifyToken,
@@ -242,7 +324,7 @@ app.get(
       const technicianEmail = req.user.email;
 
       if (!technicianEmail) {
-        return res.status(401).send({
+        return res.status(401).json({
           success: false,
           message: "Technician email not found in token.",
         });
@@ -253,7 +335,7 @@ app.get(
         .sort({ createdAt: -1 })
         .toArray();
 
-      res.status(200).send({
+      return res.status(200).json({
         success: true,
         message: "Your services retrieved successfully!",
         data: result,
@@ -261,13 +343,96 @@ app.get(
     } catch (error) {
       console.error("Get my services error:", error);
 
-      res.status(500).send({
+      return res.status(500).json({
         success: false,
         message: "Failed to retrieve your services.",
       });
     }
-  },
+  }
 );
+
+
+// ========================================
+// TECHNICIAN PAYMENT / EARNINGS
+// ========================================
+
+app.get(
+  "/api/payments/technician",
+  verifyToken,
+  verifyTechnician,
+  async (req, res) => {
+    try {
+      const technicianEmail = req.user.email;
+
+      if (!technicianEmail) {
+        return res.status(401).json({
+          success: false,
+          message: "Technician email not found in token.",
+        });
+      }
+
+      // Only count successful USD payments
+      const result = await payments
+        .aggregate([
+          {
+            $match: {
+              technicianEmail,
+              currency: "USD",
+              paymentStatus: "paid",
+            },
+          },
+          {
+            $group: {
+              _id: null,
+              totalEarnings: {
+                $sum: {
+                  $convert: {
+                    input: "$amount",
+                    to: "double",
+                    onError: 0,
+                    onNull: 0,
+                  },
+                },
+              },
+              totalPayments: {
+                $sum: 1,
+              },
+            },
+          },
+        ])
+        .toArray();
+
+      const earnings = result[0] || {
+        totalEarnings: 0,
+        totalPayments: 0,
+      };
+
+      return res.status(200).json({
+        success: true,
+        message: "Technician earnings retrieved successfully.",
+        data: {
+          totalEarnings: Number(
+            earnings.totalEarnings.toFixed(2)
+          ),
+          totalPayments: earnings.totalPayments,
+          currency: "USD",
+        },
+      });
+    } catch (error) {
+      console.error("Technician earnings error:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Failed to retrieve technician earnings.",
+      });
+    }
+  }
+);
+
+
+// ========================================
+// TECHNICIAN SERVICE REQUEST APIs
+// ========================================
 
 app.get(
   "/api/service-requests/technician",
@@ -282,25 +447,23 @@ app.get(
         .sort({ createdAt: -1 })
         .toArray();
 
-      res.status(200).send({
+      return res.status(200).json({
         success: true,
-        message: "Service requests retrieved successfully!",
+        message: "Service requests retrieved successfully.",
         data: result,
       });
     } catch (error) {
       console.error("Get technician requests error:", error);
 
-      res.status(500).send({
+      return res.status(500).json({
         success: false,
         message: "Failed to retrieve service requests.",
       });
     }
-  },
+  }
 );
 
-
-
-
+// Update technician request status
 app.patch(
   "/api/service-requests/:id/status",
   verifyToken,
@@ -310,15 +473,13 @@ app.patch(
       const { id } = req.params;
       const { status, finalAmount } = req.body;
 
-      // Validate request ID
       if (!ObjectId.isValid(id)) {
-        return res.status(400).send({
+        return res.status(400).json({
           success: false,
           message: "Invalid request ID.",
         });
       }
 
-      // Allowed statuses
       const allowedStatuses = [
         "accepted",
         "rejected",
@@ -327,87 +488,92 @@ app.patch(
       ];
 
       if (!allowedStatuses.includes(status)) {
-        return res.status(400).send({
+        return res.status(400).json({
           success: false,
           message: "Invalid request status.",
         });
       }
 
-      // Validate final amount when completing
+      let finalAmountCents = null;
+
+      // Validate final repair amount
       if (status === "completed") {
-        if (
-          finalAmount === undefined ||
-          finalAmount === null ||
-          finalAmount === "" ||
-          !Number.isFinite(Number(finalAmount)) ||
-          Number(finalAmount) <= 0
-        ) {
-          return res.status(400).send({
+        finalAmountCents = toUsdCents(finalAmount);
+
+        if (finalAmountCents === null) {
+          return res.status(400).json({
             success: false,
-            message: "Please provide a valid final amount.",
+            message:
+              "Final repair amount must be at least $1.00 USD and cannot have more than 2 decimal places.",
           });
         }
       }
 
-      // Find request belonging to this technician
       const existingRequest = await serviceRequests.findOne({
         _id: new ObjectId(id),
         technicianEmail: req.user.email,
       });
 
       if (!existingRequest) {
-        return res.status(404).send({
+        return res.status(404).json({
           success: false,
           message: "Service request not found.",
         });
       }
 
-      // Only requested requests can be accepted or rejected
       if (
         ["accepted", "rejected"].includes(status) &&
         existingRequest.status !== "requested"
       ) {
-        return res.status(400).send({
+        return res.status(400).json({
           success: false,
           message: "This request has already been processed.",
         });
       }
 
-      // Only accepted requests can be started
       if (
         status === "in-progress" &&
         existingRequest.status !== "accepted"
       ) {
-        return res.status(400).send({
+        return res.status(400).json({
           success: false,
           message: "Only accepted requests can be started.",
         });
       }
 
-      // Only ongoing jobs can be completed
       if (
         status === "completed" &&
         existingRequest.status !== "in-progress"
       ) {
-        return res.status(400).send({
+        return res.status(400).json({
           success: false,
           message: "Only ongoing jobs can be completed.",
         });
       }
 
-      // Prepare update fields
+      // Do not allow an old non-USD booking to be completed.
+      if (
+        status === "completed" &&
+        existingRequest.currency !== DATABASE_CURRENCY
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "This booking does not use USD. Please review its currency before completing it.",
+        });
+      }
+
       const updateFields = {
         status,
         updatedAt: new Date(),
       };
 
-      // Save final amount when completing
       if (status === "completed") {
-        updateFields.finalAmount = Number(finalAmount);
+        updateFields.finalAmount = finalAmountCents / 100;
+        updateFields.currency = DATABASE_CURRENCY;
         updateFields.paymentStatus = "unpaid";
       }
 
-      // Update request
       const result = await serviceRequests.updateOne(
         {
           _id: new ObjectId(id),
@@ -420,20 +586,20 @@ app.patch(
       );
 
       if (!result.modifiedCount) {
-        return res.status(409).send({
+        return res.status(409).json({
           success: false,
           message: "Request status changed. Please refresh.",
         });
       }
 
-      return res.status(200).send({
+      return res.status(200).json({
         success: true,
         message: `Request ${status} successfully!`,
       });
     } catch (error) {
       console.error("Update request status error:", error);
 
-      return res.status(500).send({
+      return res.status(500).json({
         success: false,
         message: "Failed to update request status.",
       });
@@ -441,16 +607,11 @@ app.patch(
   }
 );
 
+// ========================================
+// CUSTOMER SERVICE REQUEST APIs
+// ========================================
 
-
-
-
-// api for customer
-
-//service request APIs for customer
-
-
-
+// Customer creates repair request
 app.post(
   "/api/service-requests",
   verifyToken,
@@ -465,7 +626,6 @@ app.post(
         preferredDate,
       } = req.body;
 
-      // Validate required fields
       if (
         !serviceId ||
         !problemDescription ||
@@ -473,47 +633,46 @@ app.post(
         !address ||
         !preferredDate
       ) {
-        return res.status(400).send({
+        return res.status(400).json({
           success: false,
           message: "Please provide all required fields.",
         });
       }
 
-      // Validate service ID
       if (!ObjectId.isValid(serviceId)) {
-        return res.status(400).send({
+        return res.status(400).json({
           success: false,
           message: "Invalid service ID.",
         });
       }
 
-      // Trim input values
       const trimmedProblem = String(problemDescription).trim();
       const trimmedPhone = String(customerPhone).trim();
       const trimmedAddress = String(address).trim();
 
       if (trimmedProblem.length < 20) {
-        return res.status(400).send({
+        return res.status(400).json({
           success: false,
-          message: "Problem description must be at least 20 characters.",
+          message:
+            "Problem description must be at least 20 characters.",
         });
       }
 
       if (!trimmedPhone || !trimmedAddress) {
-        return res.status(400).send({
+        return res.status(400).json({
           success: false,
           message: "Phone number and address cannot be empty.",
         });
       }
 
-      // Validate preferred date (YYYY-MM-DD)
+      // Validate date
       const datePattern = /^\d{4}-\d{2}-\d{2}$/;
 
       if (
         typeof preferredDate !== "string" ||
         !datePattern.test(preferredDate)
       ) {
-        return res.status(400).send({
+        return res.status(400).json({
           success: false,
           message: "Please provide a valid preferred date.",
         });
@@ -523,30 +682,27 @@ app.post(
 
       const selectedDate = new Date(year, month - 1, day);
 
-      // Check whether the calendar date actually exists
       if (
         selectedDate.getFullYear() !== year ||
         selectedDate.getMonth() !== month - 1 ||
         selectedDate.getDate() !== day
       ) {
-        return res.status(400).send({
+        return res.status(400).json({
           success: false,
           message: "Please provide a valid preferred date.",
         });
       }
 
-      // Prevent past dates using server-local calendar date
       const today = new Date();
       today.setHours(0, 0, 0, 0);
 
       if (selectedDate < today) {
-        return res.status(400).send({
+        return res.status(400).json({
           success: false,
           message: "Preferred date cannot be in the past.",
         });
       }
 
-      // Find selected approved and available service
       const service = await services.findOne({
         _id: new ObjectId(serviceId),
         approvalStatus: "approved",
@@ -554,24 +710,40 @@ app.post(
       });
 
       if (!service) {
-        return res.status(404).send({
+        return res.status(404).json({
           success: false,
           message: "Service not found or unavailable.",
         });
       }
 
-      // Get customer information from verified token
+      // Do not interpret old BDT services as USD.
+      if (service.currency !== DATABASE_CURRENCY) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "This service has not been migrated to USD pricing. Please contact the administrator.",
+        });
+      }
+
+      const servicePriceCents = toUsdCents(service.basePrice);
+
+      if (servicePriceCents === null) {
+        return res.status(400).json({
+          success: false,
+          message: "This service has an invalid USD price.",
+        });
+      }
+
       const customerEmail = req.user.email;
       const customerName = req.user.name;
 
       if (!customerEmail || !customerName) {
-        return res.status(401).send({
+        return res.status(401).json({
           success: false,
           message: "Customer information missing.",
         });
       }
 
-      // Prevent duplicate active requests
       const activeRequest = await serviceRequests.findOne({
         serviceId: service._id,
         customerEmail,
@@ -581,20 +753,22 @@ app.post(
       });
 
       if (activeRequest) {
-        return res.status(409).send({
+        return res.status(409).json({
           success: false,
-          message: "You already have an active request for this service.",
+          message:
+            "You already have an active request for this service.",
         });
       }
 
-      // Create new repair request
       const newRequest = {
         serviceId: service._id,
 
         serviceTitle: service.title,
         serviceCategory: service.category,
-        servicePrice: service.basePrice,
+        servicePrice: servicePriceCents / 100,
         serviceImage: service.image,
+
+        currency: DATABASE_CURRENCY,
 
         technicianName: service.technicianName,
         technicianEmail: service.technicianEmail,
@@ -616,7 +790,7 @@ app.post(
 
       const result = await serviceRequests.insertOne(newRequest);
 
-      return res.status(201).send({
+      return res.status(201).json({
         success: true,
         message: "Repair request submitted successfully!",
         data: {
@@ -627,7 +801,7 @@ app.post(
     } catch (error) {
       console.error("Create service request error:", error);
 
-      return res.status(500).send({
+      return res.status(500).json({
         success: false,
         message: "Failed to submit repair request.",
       });
@@ -637,8 +811,6 @@ app.post(
 
 // ========================================
 // CUSTOMER CANCEL SERVICE REQUEST
-// A customer can cancel only their own
-// request while its status is "requested".
 // ========================================
 
 app.patch(
@@ -693,11 +865,7 @@ app.patch(
   }
 );
 
-
-
-
-// Get logged-in customer's bookings
-
+// Get customer's bookings
 app.get(
   "/api/service-requests/customer",
   verifyToken,
@@ -713,7 +881,8 @@ app.get(
 
       return res.status(200).json({
         success: true,
-        message: "Customer repair requests retrieved successfully.",
+        message:
+          "Customer repair requests retrieved successfully.",
         data: bookings,
       });
     } catch (error) {
@@ -727,8 +896,10 @@ app.get(
   }
 );
 
+// ========================================
+// CUSTOMER PAYMENT HISTORY
+// ========================================
 
-// Get logged-in customer's payment history
 app.get(
   "/api/payments/customer",
   verifyToken,
@@ -742,7 +913,7 @@ app.get(
         .sort({ createdAt: -1 })
         .toArray();
 
-      res.status(200).json({
+      return res.status(200).json({
         success: true,
         message: "Payment history retrieved successfully.",
         data: paymentHistory,
@@ -750,55 +921,26 @@ app.get(
     } catch (error) {
       console.error("Customer payments error:", error);
 
-      res.status(500).json({
+      return res.status(500).json({
         success: false,
         message: "Failed to retrieve payment history.",
       });
     }
-  },
+  }
 );
 
 // ========================================
 // ADMIN DASHBOARD APIs
-// All routes require a valid admin JWT
 // ========================================
 
-// 1. Admin dashboard overview
-app.get("/api/admin/overview", verifyToken, verifyAdmin, async (req, res) => {
-  try {
-    const [
-      totalUsers,
-      totalTechnicians,
-      totalCustomers,
-      totalServices,
-      pendingServices,
-      approvedServices,
-      rejectedServices,
-      totalBookings,
-      pendingBookings,
-      completedBookings,
-      totalTransactions,
-    ] = await Promise.all([
-      users.countDocuments({}),
-      users.countDocuments({ role: "technician" }),
-      users.countDocuments({ role: "customer" }),
-
-      services.countDocuments({}),
-      services.countDocuments({ approvalStatus: "pending" }),
-      services.countDocuments({ approvalStatus: "approved" }),
-      services.countDocuments({ approvalStatus: "rejected" }),
-
-      serviceRequests.countDocuments({}),
-      serviceRequests.countDocuments({ status: "pending" }),
-      serviceRequests.countDocuments({ status: "completed" }),
-
-      payments.countDocuments({}),
-    ]);
-
-    res.status(200).json({
-      success: true,
-      message: "Admin dashboard overview retrieved successfully.",
-      data: {
+// Admin overview
+app.get(
+  "/api/admin/overview",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const [
         totalUsers,
         totalTechnicians,
         totalCustomers,
@@ -810,59 +952,109 @@ app.get("/api/admin/overview", verifyToken, verifyAdmin, async (req, res) => {
         pendingBookings,
         completedBookings,
         totalTransactions,
-      },
-    });
-  } catch (error) {
-    console.error("Admin overview error:", error);
+      ] = await Promise.all([
+        users.countDocuments({}),
+        users.countDocuments({ role: "technician" }),
+        users.countDocuments({ role: "customer" }),
 
-    res.status(500).json({
-      success: false,
-      message: "Failed to retrieve admin dashboard overview.",
-    });
+        services.countDocuments({}),
+        services.countDocuments({ approvalStatus: "pending" }),
+        services.countDocuments({ approvalStatus: "approved" }),
+        services.countDocuments({ approvalStatus: "rejected" }),
+
+        serviceRequests.countDocuments({}),
+        serviceRequests.countDocuments({ status: "pending" }),
+        serviceRequests.countDocuments({ status: "completed" }),
+
+        payments.countDocuments({}),
+      ]);
+
+      return res.status(200).json({
+        success: true,
+        message:
+          "Admin dashboard overview retrieved successfully.",
+        data: {
+          totalUsers,
+          totalTechnicians,
+          totalCustomers,
+          totalServices,
+          pendingServices,
+          approvedServices,
+          rejectedServices,
+          totalBookings,
+          pendingBookings,
+          completedBookings,
+          totalTransactions,
+        },
+      });
+    } catch (error) {
+      console.error("Admin overview error:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Failed to retrieve admin dashboard overview.",
+      });
+    }
   }
-});
+);
 
-// 2. Get all users
-app.get("/api/admin/users", verifyToken, verifyAdmin, async (req, res) => {
-  try {
-    const result = await users.find({}).sort({ createdAt: -1 }).toArray();
+// Get all users
+app.get(
+  "/api/admin/users",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const result = await users
+        .find({})
+        .sort({ createdAt: -1 })
+        .toArray();
 
-    res.status(200).json({
-      success: true,
-      message: "Users retrieved successfully.",
-      data: result,
-    });
-  } catch (error) {
-    console.error("Admin users error:", error);
+      return res.status(200).json({
+        success: true,
+        message: "Users retrieved successfully.",
+        data: result,
+      });
+    } catch (error) {
+      console.error("Admin users error:", error);
 
-    res.status(500).json({
-      success: false,
-      message: "Failed to retrieve users.",
-    });
+      return res.status(500).json({
+        success: false,
+        message: "Failed to retrieve users.",
+      });
+    }
   }
-});
+);
 
-// 3. Get all services
-app.get("/api/admin/services", verifyToken, verifyAdmin, async (req, res) => {
-  try {
-    const result = await services.find({}).sort({ createdAt: -1 }).toArray();
+// Get all services
+app.get(
+  "/api/admin/services",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const result = await services
+        .find({})
+        .sort({ createdAt: -1 })
+        .toArray();
 
-    res.status(200).json({
-      success: true,
-      message: "Services retrieved successfully.",
-      data: result,
-    });
-  } catch (error) {
-    console.error("Admin services error:", error);
+      return res.status(200).json({
+        success: true,
+        message: "Services retrieved successfully.",
+        data: result,
+      });
+    } catch (error) {
+      console.error("Admin services error:", error);
 
-    res.status(500).json({
-      success: false,
-      message: "Failed to retrieve services.",
-    });
+      return res.status(500).json({
+        success: false,
+        message: "Failed to retrieve services.",
+      });
+    }
   }
-});
+);
 
-// 4. Approve or reject a service
+// Approve or reject service
 app.patch(
   "/api/admin/services/:id/approval",
   verifyToken,
@@ -882,7 +1074,8 @@ app.patch(
       if (!["approved", "rejected"].includes(approvalStatus)) {
         return res.status(400).json({
           success: false,
-          message: "Approval status must be approved or rejected.",
+          message:
+            "Approval status must be approved or rejected.",
         });
       }
 
@@ -896,7 +1089,7 @@ app.patch(
             approvalStatus,
             reviewedAt: new Date(),
           },
-        },
+        }
       );
 
       if (!result.matchedCount) {
@@ -906,22 +1099,22 @@ app.patch(
         });
       }
 
-      res.status(200).json({
+      return res.status(200).json({
         success: true,
         message: `Service ${approvalStatus} successfully.`,
       });
     } catch (error) {
       console.error("Service approval error:", error);
 
-      res.status(500).json({
+      return res.status(500).json({
         success: false,
         message: "Failed to update service approval.",
       });
     }
-  },
+  }
 );
 
-// 5. Delete a service
+// Delete a service
 app.delete(
   "/api/admin/services/:id",
   verifyToken,
@@ -948,54 +1141,62 @@ app.delete(
         });
       }
 
-      res.status(200).json({
+      return res.status(200).json({
         success: true,
         message: "Service deleted successfully.",
       });
     } catch (error) {
       console.error("Delete service error:", error);
 
-      res.status(500).json({
+      return res.status(500).json({
         success: false,
         message: "Failed to delete service.",
       });
     }
-  },
+  }
 );
 
-// 6. Get all bookings
-app.get("/api/admin/bookings", verifyToken, verifyAdmin, async (req, res) => {
-  try {
-    const result = await serviceRequests
-      .find({})
-      .sort({ createdAt: -1 })
-      .toArray();
+// Get all bookings
+app.get(
+  "/api/admin/bookings",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const result = await serviceRequests
+        .find({})
+        .sort({ createdAt: -1 })
+        .toArray();
 
-    res.status(200).json({
-      success: true,
-      message: "Bookings retrieved successfully.",
-      data: result,
-    });
-  } catch (error) {
-    console.error("Admin bookings error:", error);
+      return res.status(200).json({
+        success: true,
+        message: "Bookings retrieved successfully.",
+        data: result,
+      });
+    } catch (error) {
+      console.error("Admin bookings error:", error);
 
-    res.status(500).json({
-      success: false,
-      message: "Failed to retrieve bookings.",
-    });
+      return res.status(500).json({
+        success: false,
+        message: "Failed to retrieve bookings.",
+      });
+    }
   }
-});
+);
 
-// 7. Get all transactions
+// Get all transactions
 app.get(
   "/api/admin/transactions",
   verifyToken,
   verifyAdmin,
   async (req, res) => {
     try {
-      const result = await payments.find({}).sort({ createdAt: -1 }).toArray();
+      const result = await payments
+        .find({})
+        .sort({ createdAt: -1 })
+        .toArray();
 
-      res.status(200).json({
+      return res.status(200).json({
         success: true,
         message: "Transactions retrieved successfully.",
         data: result,
@@ -1003,16 +1204,19 @@ app.get(
     } catch (error) {
       console.error("Admin transactions error:", error);
 
-      res.status(500).json({
+      return res.status(500).json({
         success: false,
         message: "Failed to retrieve transactions.",
       });
     }
-  },
+  }
 );
 
+// ========================================
+// PUBLIC SERVICE APIs
+// ========================================
 
-// public service APIs
+// Get all approved services
 app.get("/api/services", async (req, res) => {
   try {
     const result = await services
@@ -1023,7 +1227,7 @@ app.get("/api/services", async (req, res) => {
       .sort({ createdAt: -1 })
       .toArray();
 
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
       message: "Available services retrieved successfully.",
       data: result,
@@ -1031,14 +1235,14 @@ app.get("/api/services", async (req, res) => {
   } catch (error) {
     console.error("Get services error:", error);
 
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       message: "Failed to retrieve services.",
     });
   }
 });
-// GET individual service details
 
+// Get individual service details
 app.get("/api/services/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -1063,7 +1267,6 @@ app.get("/api/services/:id", async (req, res) => {
       });
     }
 
-    // Get technician profile from users collection
     const technician = await users.findOne(
       {
         email: service.technicianEmail,
@@ -1080,7 +1283,7 @@ app.get("/api/services/:id", async (req, res) => {
       }
     );
 
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
       message: "Service details retrieved successfully.",
       data: {
@@ -1099,7 +1302,7 @@ app.get("/api/services/:id", async (req, res) => {
   } catch (error) {
     console.error("Get service details error:", error);
 
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       message: "Failed to retrieve service details.",
     });
@@ -1118,7 +1321,7 @@ app.get("/api/featured-services", async (req, res) => {
       .limit(6)
       .toArray();
 
-    res.status(200).send({
+    return res.status(200).json({
       success: true,
       message: "Featured services fetched successfully.",
       data: featuredServices,
@@ -1126,20 +1329,19 @@ app.get("/api/featured-services", async (req, res) => {
   } catch (error) {
     console.error("Error fetching featured services:", error);
 
-    res.status(500).send({
+    return res.status(500).json({
       success: false,
       message: "Failed to fetch featured services.",
     });
   }
 });
 
-
-
 // ========================================
-// CREATE STRIPE CHECKOUT SESSION
+// STRIPE CHECKOUT SESSION
+// ========================================
+
 // Customer can pay only for their own
 // completed and unpaid repair request.
-// ========================================
 
 app.post(
   "/api/payments/create-checkout-session",
@@ -1168,28 +1370,39 @@ app.post(
       if (!booking) {
         return res.status(404).json({
           success: false,
-          message:
-            "Completed unpaid booking not found.",
+          message: "Completed unpaid booking not found.",
         });
       }
 
-      const finalAmount = Number(booking.finalAmount);
-
-      if (!Number.isFinite(finalAmount) || finalAmount <= 0) {
+      // Only USD bookings can be paid through this endpoint.
+      if (booking.currency !== DATABASE_CURRENCY) {
         return res.status(400).json({
           success: false,
-          message: "Invalid final repair amount.",
+          message:
+            "This booking does not use USD. Please contact support.",
         });
       }
 
-      // Reuse an existing open Checkout Session
+      const finalAmountCents = toUsdCents(booking.finalAmount);
+
+      if (finalAmountCents === null) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Invalid final repair amount. Minimum payment is $1.00 USD.",
+        });
+      }
+
+      // Reuse an existing open USD Checkout Session.
       if (booking.stripeSessionId) {
-        const existingSession = await stripe.checkout.sessions.retrieve(
-          booking.stripeSessionId
-        );
+        const existingSession =
+          await stripe.checkout.sessions.retrieve(
+            booking.stripeSessionId
+          );
 
         if (
           existingSession.status === "open" &&
+          existingSession.currency === CURRENCY &&
           existingSession.url
         ) {
           return res.status(200).json({
@@ -1198,15 +1411,23 @@ app.post(
             url: existingSession.url,
           });
         }
+
+        // Expire an old open session with a different currency.
+        if (existingSession.status === "open") {
+          await stripe.checkout.sessions.expire(
+            existingSession.id
+          );
+        }
       }
 
       const frontendUrl = process.env.CLIENT_URL.replace(/\/$/, "");
 
-      // Create a new Stripe Checkout Session
+      if (!frontendUrl) {
+        throw new Error("CLIENT_URL is not configured.");
+      }
+
       const session = await stripe.checkout.sessions.create({
         mode: "payment",
-
-       
 
         customer_email: booking.customerEmail,
 
@@ -1215,13 +1436,12 @@ app.post(
         line_items: [
           {
             price_data: {
-              currency: "bdt",
+              currency: CURRENCY,
               product_data: {
                 name: booking.serviceTitle || "FixMate Repair Service",
                 description: `Repair booking #${booking._id}`,
               },
-              // BDT uses two decimal places.
-              unit_amount: Math.round(finalAmount * 100),
+              unit_amount: finalAmountCents,
             },
             quantity: 1,
           },
@@ -1239,7 +1459,6 @@ app.post(
           `${frontendUrl}/dashboard/customer/bookings?payment=cancelled`,
       });
 
-      // Save the Checkout Session ID with the booking
       await serviceRequests.updateOne(
         {
           _id: booking._id,
@@ -1271,9 +1490,9 @@ app.post(
   }
 );
 
-
-
-
+// ========================================
+// VERIFY STRIPE CHECKOUT SESSION
+// ========================================
 
 app.post(
   "/api/payments/verify-session",
@@ -1291,8 +1510,8 @@ app.post(
         });
       }
 
-      // Retrieve the session directly from Stripe
-      const session = await stripe.checkout.sessions.retrieve(sessionId);
+      const session =
+        await stripe.checkout.sessions.retrieve(sessionId);
 
       if (
         session.status !== "complete" ||
@@ -1332,14 +1551,14 @@ app.post(
         });
       }
 
-      const expectedAmount = Math.round(
-        Number(booking.finalAmount) * 100
-      );
+      const expectedAmount = toUsdCents(booking.finalAmount);
 
       if (
-        !Number.isFinite(expectedAmount) ||
+        booking.currency !== DATABASE_CURRENCY ||
+        expectedAmount === null ||
         session.amount_total !== expectedAmount ||
-        session.currency !== "bdt"
+        session.currency !== CURRENCY ||
+        session.client_reference_id !== booking._id.toString()
       ) {
         return res.status(400).json({
           success: false,
@@ -1356,7 +1575,7 @@ app.post(
           ? session.payment_intent
           : session.payment_intent?.id || session.id;
 
-      // Insert a payment record only once per Stripe session
+      // Insert payment record only once per Stripe session.
       await payments.updateOne(
         { stripeSessionId: session.id },
         {
@@ -1367,12 +1586,15 @@ app.post(
             customerEmail: booking.customerEmail,
             technicianName: booking.technicianName,
             technicianEmail: booking.technicianEmail,
+
             amount: Number(booking.finalAmount),
-            currency: "BDT",
+            currency: DATABASE_CURRENCY,
+
             transactionId,
             stripeSessionId: session.id,
             paymentStatus: "paid",
             paymentMethod: "Card",
+
             paidAt,
             createdAt: new Date(),
           },
@@ -1380,7 +1602,7 @@ app.post(
         { upsert: true }
       );
 
-      // Update booking payment status
+      // Update booking payment status.
       await serviceRequests.updateOne(
         {
           _id: booking._id,
@@ -1413,11 +1635,15 @@ app.post(
   }
 );
 
-
-
+// ========================================
+// SERVER STATUS
+// ========================================
 
 app.get("/", (req, res) => {
-  res.send({ message: "Welcome to FixMate!" });
+  res.send({
+    message: "Welcome to FixMate!",
+    currency: DATABASE_CURRENCY,
+  });
 });
 
 app.listen(PORT, () => {
