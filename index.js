@@ -52,7 +52,7 @@ const connectedClient = await connectToMongoDB();
 
 const database = connectedClient.db("fixmate");
 
-const users = database.collection("users");
+const users = database.collection("user");
 const sessions = database.collection("sessions");
 const payments = database.collection("payments");
 const services = database.collection("services");
@@ -179,6 +179,8 @@ const verifyAdmin = async (req, res, next) => {
 
   next();
 };
+
+
 
 // ========================================
 // TECHNICIAN SERVICE APIs
@@ -998,6 +1000,8 @@ app.get(
   }
 );
 
+
+
 // Get all users
 app.get(
   "/api/admin/users",
@@ -1021,6 +1025,108 @@ app.get(
       return res.status(500).json({
         success: false,
         message: "Failed to retrieve users.",
+      });
+    }
+  }
+);
+// Update a user's role (Admin only)
+app.patch(
+  "/api/admin/users/:id/role",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { role } = req.body;
+
+      const allowedRoles = ["customer", "technician", "admin"];
+
+      // Validate user ID
+      if (!id || id.length > 100) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid user ID.",
+        });
+      }
+
+      // Validate role
+      if (!allowedRoles.includes(role)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid role. Allowed roles: customer, technician, admin.",
+        });
+      }
+
+      // Support MongoDB ObjectId and string-based IDs
+      const userFilter = ObjectId.isValid(id)
+        ? {
+            $or: [
+              { _id: new ObjectId(id) },
+              { _id: id },
+            ],
+          }
+        : { _id: id };
+
+      const targetUser = await users.findOne(userFilter);
+
+      if (!targetUser) {
+        return res.status(404).json({
+          success: false,
+          message: "User not found.",
+        });
+      }
+
+      // Prevent an admin from changing their own role
+      if (
+        (req.user.email &&
+          targetUser.email?.toLowerCase() === req.user.email.toLowerCase()) ||
+        (req.user.sub &&
+          String(targetUser._id) === String(req.user.sub))
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "You cannot change your own role.",
+        });
+      }
+
+      // Prevent removing the last admin
+      if (targetUser.role === "admin" && role !== "admin") {
+        const adminCount = await users.countDocuments({
+          role: "admin",
+        });
+
+        if (adminCount <= 1) {
+          return res.status(400).json({
+            success: false,
+            message: "You cannot remove the last admin.",
+          });
+        }
+      }
+
+      // Update role
+      await users.updateOne(userFilter, {
+        $set: {
+          role,
+          updatedAt: new Date(),
+        },
+      });
+
+      return res.status(200).json({
+        success: true,
+        message: "User role updated successfully.",
+        data: {
+          _id: targetUser._id,
+          name: targetUser.name,
+          email: targetUser.email,
+          role,
+        },
+      });
+    } catch (error) {
+      console.error("Update user role error:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Failed to update user role.",
       });
     }
   }
@@ -1183,6 +1289,132 @@ app.get(
     }
   }
 );
+
+// ========================================
+// ADMIN UPDATE BOOKING STATUS
+// ========================================
+
+app.patch(
+  "/api/admin/bookings/:id/status",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { status, finalAmount } = req.body;
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid booking ID.",
+        });
+      }
+
+      const allowedStatuses = [
+        "accepted",
+        "rejected",
+        "in-progress",
+        "completed",
+        "cancelled",
+      ];
+
+      if (!allowedStatuses.includes(status)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid booking status.",
+        });
+      }
+
+      const booking = await serviceRequests.findOne({
+        _id: new ObjectId(id),
+      });
+
+      if (!booking) {
+        return res.status(404).json({
+          success: false,
+          message: "Booking not found.",
+        });
+      }
+
+      // Only allow valid status transitions.
+      const allowedTransitions = {
+        requested: ["accepted", "rejected", "cancelled"],
+        accepted: ["in-progress", "cancelled"],
+        "in-progress": ["completed", "cancelled"],
+        completed: [],
+        rejected: [],
+        cancelled: [],
+      };
+
+      if (!allowedTransitions[booking.status]?.includes(status)) {
+        return res.status(400).json({
+          success: false,
+          message: `Cannot change booking from ${booking.status} to ${status}.`,
+        });
+      }
+
+      const updateFields = {
+        status,
+        updatedAt: new Date(),
+      };
+
+      // Validate final repair amount when completing a booking.
+      if (status === "completed") {
+        if (booking.currency !== DATABASE_CURRENCY) {
+          return res.status(400).json({
+            success: false,
+            message: "Only USD bookings can be completed.",
+          });
+        }
+
+        const amountCents = toUsdCents(finalAmount);
+
+        if (amountCents === null) {
+          return res.status(400).json({
+            success: false,
+            message:
+              "Final repair amount must be at least $1.00 USD with a maximum of 2 decimal places.",
+          });
+        }
+
+        updateFields.finalAmount = amountCents / 100;
+        updateFields.paymentStatus = "unpaid";
+      }
+
+      const result = await serviceRequests.updateOne(
+        {
+          _id: new ObjectId(id),
+          status: booking.status,
+          paymentStatus: { $ne: "paid" },
+        },
+        {
+          $set: updateFields,
+        }
+      );
+
+      if (!result.modifiedCount) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "Booking was changed or already paid. Please refresh.",
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: `Booking ${status} successfully.`,
+      });
+    } catch (error) {
+      console.error("Admin booking status update error:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Failed to update booking status.",
+      });
+    }
+  }
+);
+
 
 // Get all transactions
 app.get(
