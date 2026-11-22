@@ -355,6 +355,306 @@ app.get(
 
 
 // ========================================
+// UPDATE TECHNICIAN SERVICE
+// ========================================
+
+app.patch(
+  "/api/services/:id",
+  verifyToken,
+  verifyTechnician,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid service ID.",
+        });
+      }
+
+      const {
+        title,
+        category,
+        description,
+        image,
+        basePrice,
+        estimatedDuration,
+        serviceMode,
+        serviceArea,
+      } = req.body;
+
+      // Validate required fields
+      if (
+        !title ||
+        !category ||
+        !description ||
+        !image ||
+        !estimatedDuration ||
+        !serviceMode ||
+        !serviceArea ||
+        basePrice === undefined ||
+        basePrice === null ||
+        basePrice === ""
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Please provide all required fields.",
+        });
+      }
+
+      const allowedCategories = [
+        "Smartphone",
+        "Laptop & PC",
+        "AC",
+        "Refrigerator",
+        "TV",
+        "Washing Machine",
+        "Electrical",
+      ];
+
+      const allowedServiceModes = [
+        "Home Visit",
+        "Shop Drop-off",
+      ];
+
+      if (!allowedCategories.includes(category)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid service category.",
+        });
+      }
+
+      if (!allowedServiceModes.includes(serviceMode)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid service mode.",
+        });
+      }
+
+      const trimmedTitle = String(title).trim();
+      const trimmedDescription = String(description).trim();
+      const trimmedImage = String(image).trim();
+      const trimmedDuration = String(estimatedDuration).trim();
+      const trimmedArea = String(serviceArea).trim();
+
+      if (
+        !trimmedTitle ||
+        !trimmedDescription ||
+        !trimmedImage ||
+        !trimmedDuration ||
+        !trimmedArea
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Fields cannot contain only spaces.",
+        });
+      }
+
+      const priceCents = toUsdCents(basePrice);
+
+      if (priceCents === null) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Service price must be at least $1.00 USD and cannot have more than 2 decimal places.",
+        });
+      }
+
+      const technicianEmail = req.user.email;
+
+      if (!technicianEmail) {
+        return res.status(401).json({
+          success: false,
+          message: "Technician email not found in token.",
+        });
+      }
+
+      // Only update the logged-in technician's own service.
+      const result = await services.updateOne(
+        {
+          _id: new ObjectId(id),
+          technicianEmail,
+        },
+        {
+          $set: {
+            title: trimmedTitle,
+            category,
+            description: trimmedDescription,
+            image: trimmedImage,
+            basePrice: priceCents / 100,
+            currency: DATABASE_CURRENCY,
+            estimatedDuration: trimmedDuration,
+            serviceMode,
+            serviceArea: trimmedArea,
+
+            // Every edit requires admin approval again.
+            approvalStatus: "pending",
+            reviewedAt: null,
+
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      if (!result.matchedCount) {
+        return res.status(404).json({
+          success: false,
+          message: "Service not found or you do not own this service.",
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        message:
+          "Service updated successfully! It is now pending admin approval.",
+      });
+    } catch (error) {
+      console.error("Update technician service error:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Failed to update service.",
+      });
+    }
+  }
+);
+
+// ========================================
+// DELETE TECHNICIAN SERVICE
+// ========================================
+
+app.delete(
+  "/api/services/:id",
+  verifyToken,
+  verifyTechnician,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid service ID.",
+        });
+      }
+
+      const technicianEmail = req.user.email;
+
+      if (!technicianEmail) {
+        return res.status(401).json({
+          success: false,
+          message: "Technician email not found in token.",
+        });
+      }
+
+      // Delete only the logged-in technician's own service.
+      const result = await services.deleteOne({
+        _id: new ObjectId(id),
+        technicianEmail,
+      });
+
+      if (!result.deletedCount) {
+        return res.status(404).json({
+          success: false,
+          message: "Service not found or you do not own this service.",
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: "Service deleted successfully!",
+      });
+    } catch (error) {
+      console.error("Delete technician service error:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Failed to delete service.",
+      });
+    }
+  }
+);
+
+// ========================================
+// TOGGLE TECHNICIAN SERVICE AVAILABILITY
+// ========================================
+
+app.patch(
+  "/api/services/:id/availability",
+  verifyToken,
+  verifyTechnician,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { isAvailable } = req.body;
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid service ID.",
+        });
+      }
+
+      if (typeof isAvailable !== "boolean") {
+        return res.status(400).json({
+          success: false,
+          message: "isAvailable must be true or false.",
+        });
+      }
+
+      const technicianEmail = req.user.email;
+
+      if (!technicianEmail) {
+        return res.status(401).json({
+          success: false,
+          message: "Technician email not found in token.",
+        });
+      }
+
+      // Update only the logged-in technician's own service.
+      const result = await services.updateOne(
+        {
+          _id: new ObjectId(id),
+          technicianEmail,
+        },
+        {
+          $set: {
+            isAvailable,
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      if (!result.matchedCount) {
+        return res.status(404).json({
+          success: false,
+          message: "Service not found or you do not own this service.",
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: isAvailable
+          ? "Service is now available."
+          : "Service is now unavailable.",
+        data: {
+          isAvailable,
+        },
+      });
+    } catch (error) {
+      console.error("Toggle service availability error:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Failed to update service availability.",
+      });
+    }
+  }
+);
+
+
+// ========================================
 // TECHNICIAN PAYMENT / EARNINGS
 // ========================================
 
