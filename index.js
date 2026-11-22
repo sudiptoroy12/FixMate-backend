@@ -317,41 +317,121 @@ app.post(
 );
 
 // Get services created by logged-in technician
-app.get(
-  "/api/services/my-services",
-  verifyToken,
-  verifyTechnician,
-  async (req, res) => {
-    try {
-      const technicianEmail = req.user.email;
 
-      if (!technicianEmail) {
-        return res.status(401).json({
-          success: false,
-          message: "Technician email not found in token.",
-        });
-      }
+app.get("/api/services", async (req, res) => {
+  try {
+    const {
+      search = "",
+      category = "",
+      serviceMode = "",
+      sort = "newest",
+    } = req.query;
 
-      const result = await services
-        .find({ technicianEmail })
-        .sort({ createdAt: -1 })
-        .toArray();
+    // Validate category
+    const allowedCategories = [
+      "Smartphone",
+      "Laptop & PC",
+      "AC",
+      "Refrigerator",
+      "TV",
+      "Washing Machine",
+      "Electrical",
+    ];
 
-      return res.status(200).json({
-        success: true,
-        message: "Your services retrieved successfully!",
-        data: result,
-      });
-    } catch (error) {
-      console.error("Get my services error:", error);
-
-      return res.status(500).json({
+    if (category && !allowedCategories.includes(category)) {
+      return res.status(400).json({
         success: false,
-        message: "Failed to retrieve your services.",
+        message: "Invalid category.",
       });
     }
+
+    // Validate service mode
+    const allowedServiceModes = [
+      "Home Visit",
+      "Shop Drop-off",
+    ];
+
+    if (
+      serviceMode &&
+      !allowedServiceModes.includes(serviceMode)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid service mode.",
+      });
+    }
+
+    // Validate sorting option
+    const sortOptions = {
+      "price-asc": { basePrice: 1 },
+      "price-desc": { basePrice: -1 },
+      newest: { createdAt: -1 },
+    };
+
+    if (!sortOptions[sort]) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid sorting option.",
+      });
+    }
+
+    // Escape special regex characters
+    const escapedSearch = String(search)
+      .trim()
+      .replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+    // Build MongoDB query
+    const query = {
+      approvalStatus: "approved",
+      isAvailable: true,
+    };
+
+    if (category) {
+      query.category = category;
+    }
+
+    if (serviceMode) {
+      query.serviceMode = serviceMode;
+    }
+
+    if (escapedSearch) {
+      query.$or = [
+        {
+          title: {
+            $regex: escapedSearch,
+            $options: "i",
+          },
+        },
+        {
+          category: {
+            $regex: escapedSearch,
+            $options: "i",
+          },
+        },
+      ];
+    }
+
+    // Search, filter and sort on MongoDB
+    const result = await services
+      .find(query)
+      .sort(sortOptions[sort])
+      .toArray();
+
+    return res.status(200).json({
+      success: true,
+      message: "Services retrieved successfully.",
+      data: result,
+    });
+  } catch (error) {
+    console.error("Get services error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to retrieve services.",
+    });
   }
-);
+});
+
 
 
 // ========================================
@@ -2214,7 +2294,7 @@ app.post(
 app.get("/", (req, res) => {
   res.send({
     message: "Welcome to FixMate!",
-    currency: DATABASE_CURRENCY,
+    
   });
 });
 
