@@ -1985,10 +1985,10 @@ app.post(
         },
 
         success_url:
-          `${frontendUrl}/dashboard/customer/payments?payment=success&session_id={CHECKOUT_SESSION_ID}`,
+          `${frontendUrl}/dashboard/customer/payments/success?payment=success&session_id={CHECKOUT_SESSION_ID}`,
 
         cancel_url:
-          `${frontendUrl}/dashboard/customer/bookings?payment=cancelled`,
+          `${frontendUrl}/dashboard/customer/payments/cancel?payment=cancelled`,
       });
 
       await serviceRequests.updateOne(
@@ -2026,6 +2026,7 @@ app.post(
 // VERIFY STRIPE CHECKOUT SESSION
 // ========================================
 
+
 app.post(
   "/api/payments/verify-session",
   verifyToken,
@@ -2035,6 +2036,7 @@ app.post(
       const { sessionId } = req.body;
       const customerEmail = req.user.email;
 
+      // 1. Validate session ID
       if (!sessionId || typeof sessionId !== "string") {
         return res.status(400).json({
           success: false,
@@ -2042,9 +2044,11 @@ app.post(
         });
       }
 
+      // 2. Retrieve Stripe Checkout Session
       const session =
         await stripe.checkout.sessions.retrieve(sessionId);
 
+      // 3. Verify Stripe payment status
       if (
         session.status !== "complete" ||
         session.payment_status !== "paid" ||
@@ -2056,6 +2060,7 @@ app.post(
         });
       }
 
+      // 4. Validate booking metadata and customer ownership
       const bookingId = session.metadata?.bookingId;
 
       if (
@@ -2069,6 +2074,7 @@ app.post(
         });
       }
 
+      // 5. Find the customer's completed booking
       const booking = await serviceRequests.findOne({
         _id: new ObjectId(bookingId),
         customerEmail,
@@ -2083,6 +2089,7 @@ app.post(
         });
       }
 
+      // 6. Validate payment amount and currency
       const expectedAmount = toUsdCents(booking.finalAmount);
 
       if (
@@ -2098,6 +2105,23 @@ app.post(
         });
       }
 
+      // 7. Additional Stripe customer email validation
+      const stripeCustomerEmail =
+        session.customer_details?.email ||
+        session.customer_email;
+
+      if (
+        stripeCustomerEmail &&
+        stripeCustomerEmail.toLowerCase() !==
+          customerEmail.toLowerCase()
+      ) {
+        return res.status(403).json({
+          success: false,
+          message: "Payment customer email does not match.",
+        });
+      }
+
+      // 8. Get payment information
       const paidAt = session.created
         ? new Date(session.created * 1000)
         : new Date();
@@ -2107,15 +2131,19 @@ app.post(
           ? session.payment_intent
           : session.payment_intent?.id || session.id;
 
-      // Insert payment record only once per Stripe session.
+      // 9. Save payment record only once per Stripe session
       await payments.updateOne(
-        { stripeSessionId: session.id },
+        {
+          stripeSessionId: session.id,
+        },
         {
           $setOnInsert: {
             bookingId: booking._id.toString(),
             serviceTitle: booking.serviceTitle,
+
             customerName: booking.customerName,
             customerEmail: booking.customerEmail,
+
             technicianName: booking.technicianName,
             technicianEmail: booking.technicianEmail,
 
@@ -2124,6 +2152,7 @@ app.post(
 
             transactionId,
             stripeSessionId: session.id,
+
             paymentStatus: "paid",
             paymentMethod: "Card",
 
@@ -2131,10 +2160,12 @@ app.post(
             createdAt: new Date(),
           },
         },
-        { upsert: true }
+        {
+          upsert: true,
+        }
       );
 
-      // Update booking payment status.
+      // 10. Update booking payment status
       await serviceRequests.updateOne(
         {
           _id: booking._id,
@@ -2151,11 +2182,19 @@ app.post(
         }
       );
 
+      // 11. Return payment details to frontend
       return res.status(200).json({
         success: true,
         message: "Payment verified successfully.",
-        bookingId: booking._id.toString(),
-      });
+        data: {
+          bookingId: booking._id.toString(),
+          serviceTitle: booking.serviceTitle,
+          amount: Number(booking.finalAmount),
+          currency: DATABASE_CURRENCY,
+          transactionId,
+          paidAt,
+        },
+      });pa
     } catch (error) {
       console.error("Payment verification error:", error);
 
@@ -2166,6 +2205,7 @@ app.post(
     }
   }
 );
+
 
 // ========================================
 // SERVER STATUS
