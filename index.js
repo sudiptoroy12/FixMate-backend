@@ -23,7 +23,217 @@ app.use(
   })
 );
 
+
+app.post(
+  "/api/payments/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+    if (!webhookSecret) {
+      console.error("STRIPE_WEBHOOK_SECRET is not configured.");
+      return res.status(500).send("Webhook configuration error.");
+    }
+
+    const signature = req.headers["stripe-signature"];
+
+    if (!signature) {
+      return res.status(400).send("Missing Stripe signature.");
+    }
+
+    let event;
+
+    // 1. Verify Stripe webhook signature
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        signature,
+        webhookSecret
+      );
+    } catch (error) {
+      console.error("Webhook signature verification failed:", error.message);
+      return res.status(400).send("Invalid webhook signature.");
+    }
+
+    try {
+      // 2. Handle successful Checkout payments
+      if (
+        event.type !== "checkout.session.completed" &&
+        event.type !== "checkout.session.async_payment_succeeded"
+      ) {
+        return res.status(200).json({
+          received: true,
+          message: "Event ignored.",
+        });
+      }
+
+      const session = event.data.object;
+
+      // 3. Confirm the payment actually succeeded
+      if (
+        session.status !== "complete" ||
+        session.payment_status !== "paid" ||
+        session.mode !== "payment"
+      ) {
+        return res.status(200).json({
+          received: true,
+          message: "Payment is not completed yet.",
+        });
+      }
+
+      // 4. Get booking information from Stripe metadata
+      const { bookingId, customerEmail } = session.metadata || {};
+
+      if (!bookingId || !customerEmail) {
+        console.error("Missing booking metadata:", session.id);
+
+        return res.status(400).json({
+          received: false,
+          message: "Missing booking metadata.",
+        });
+      }
+
+      if (!ObjectId.isValid(bookingId)) {
+        return res.status(400).json({
+          received: false,
+          message: "Invalid booking ID.",
+        });
+      }
+
+      // 5. Find the correct booking
+      const booking = await serviceRequests.findOne({
+        _id: new ObjectId(bookingId),
+        customerEmail,
+        stripeSessionId: session.id,
+      });
+
+      if (!booking) {
+        console.error("Booking not found for Stripe session:", session.id);
+
+        return res.status(404).json({
+          received: false,
+          message: "Booking not found.",
+        });
+      }
+
+      // 6. Validate booking status
+     if (
+  booking.status !== "completed" ||
+  booking.currency !== DATABASE_CURRENCY ||
+  session.client_reference_id !== booking._id.toString() ||
+  booking.customerEmail.toLowerCase() !== customerEmail.toLowerCase()
+) {
+  return res.status(400).json({
+    received: false,
+    message: "Booking validation failed.",
+  });
+}
+
+      // 7. Validate currency and amount using database values
+      const expectedAmount = Math.round(
+        Number(booking.finalAmount) * 100
+      );
+
+      if (
+        !Number.isFinite(expectedAmount) ||
+        expectedAmount <= 0 ||
+        session.amount_total !== expectedAmount ||
+        session.currency !== "usd"
+      ) {
+        console.error("Stripe payment amount mismatch:", {
+          sessionId: session.id,
+          expectedAmount,
+          receivedAmount: session.amount_total,
+          receivedCurrency: session.currency,
+        });
+
+        return res.status(400).json({
+          received: false,
+          message: "Payment amount or currency mismatch.",
+        });
+      }
+
+      // 8. Get the Stripe PaymentIntent ID
+      const paymentIntentId =
+        typeof session.payment_intent === "string"
+          ? session.payment_intent
+          : session.payment_intent?.id;
+
+      // 9. Save payment only once
+      // The unique stripeSessionId index prevents duplicate payments.
+      await payments.updateOne(
+        {
+          stripeSessionId: session.id,
+        },
+        {
+          $setOnInsert: {
+            bookingId: booking._id.toString(),
+
+            serviceTitle: booking.serviceTitle,
+            customerName: booking.customerName,
+            customerEmail: booking.customerEmail,
+
+            technicianName: booking.technicianName,
+            technicianEmail: booking.technicianEmail,
+
+            amount: booking.finalAmount,
+            currency: "USD",
+
+            transactionId: paymentIntentId || session.id,
+            stripeSessionId: session.id,
+
+            paymentStatus: "paid",
+            paymentMethod: "Card",
+
+            paidAt: new Date(),
+            createdAt: new Date(),
+          },
+        },
+        {
+          upsert: true,
+        }
+      );
+
+      // 10. Update booking payment status
+      await serviceRequests.updateOne(
+        {
+          _id: booking._id,
+          stripeSessionId: session.id,
+        },
+        {
+          $set: {
+            paymentStatus: "paid",
+            paidAt: new Date(),
+            stripePaymentIntentId: paymentIntentId || null,
+          },
+        }
+      );
+
+      console.log(
+        `Payment successfully processed for booking ${booking._id}`
+      );
+
+      return res.status(200).json({
+        received: true,
+        message: "Payment processed successfully.",
+      });
+    } catch (error) {
+      console.error("Stripe webhook processing error:", error);
+
+      // Return 500 so Stripe can retry the event.
+      return res.status(500).json({
+        received: false,
+        message: "Webhook processing failed.",
+      });
+    }
+  }
+);
+
+// JSON middleware must come AFTER the webhook route.
 app.use(express.json());
+
+
+
 
 // ========================================
 // DATABASE CONNECTION
@@ -53,7 +263,6 @@ const connectedClient = await connectToMongoDB();
 const database = connectedClient.db("fixmate");
 
 const users = database.collection("user");
-const sessions = database.collection("sessions");
 const payments = database.collection("payments");
 const services = database.collection("services");
 const serviceRequests = database.collection("serviceRequests");
@@ -316,7 +525,7 @@ app.post(
   }
 );
 
-// Get services created by logged-in technician
+
 
 app.get("/api/services", async (req, res) => {
   try {
@@ -1828,31 +2037,7 @@ app.get(
 // PUBLIC SERVICE APIs
 // ========================================
 
-// Get all approved services
-app.get("/api/services", async (req, res) => {
-  try {
-    const result = await services
-      .find({
-        approvalStatus: "approved",
-        isAvailable: true,
-      })
-      .sort({ createdAt: -1 })
-      .toArray();
 
-    return res.status(200).json({
-      success: true,
-      message: "Available services retrieved successfully.",
-      data: result,
-    });
-  } catch (error) {
-    console.error("Get services error:", error);
-
-    return res.status(500).json({
-      success: false,
-      message: "Failed to retrieve services.",
-    });
-  }
-});
 
 // Get individual service details
 app.get("/api/services/:id", async (req, res) => {
@@ -2032,7 +2217,7 @@ app.post(
         }
       }
 
-      const frontendUrl = process.env.CLIENT_URL.replace(/\/$/, "");
+      const frontendUrl = process.env.CLIENT_URL?.replace(/\/$/, "");
 
       if (!frontendUrl) {
         throw new Error("CLIENT_URL is not configured.");
@@ -2274,7 +2459,7 @@ app.post(
           transactionId,
           paidAt,
         },
-      });pa
+      });
     } catch (error) {
       console.error("Payment verification error:", error);
 
