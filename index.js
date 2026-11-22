@@ -116,7 +116,7 @@ app.post(
         });
       }
 
-      // 6. Validate booking status
+        // 6. Validate booking status
      if (
   booking.status !== "completed" ||
   booking.currency !== DATABASE_CURRENCY ||
@@ -2033,9 +2033,46 @@ app.get(
   }
 );
 
+
 // ========================================
-// PUBLIC SERVICE APIs
+// GET TECHNICIAN'S OWN SERVICES
 // ========================================
+
+app.get(
+  "/api/services/my-services",
+  verifyToken,
+  verifyTechnician,
+  async (req, res) => {
+    try {
+      const technicianEmail = req.user.email;
+
+      if (!technicianEmail) {
+        return res.status(401).json({
+          success: false,
+          message: "Technician email not found in token.",
+        });
+      }
+
+      const result = await services
+        .find({ technicianEmail })
+        .sort({ createdAt: -1 })
+        .toArray();
+
+      return res.status(200).json({
+        success: true,
+        message: "Your services retrieved successfully.",
+        data: result,
+      });
+    } catch (error) {
+      console.error("Get technician services error:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Failed to retrieve your services.",
+      });
+    }
+  }
+);
 
 
 
