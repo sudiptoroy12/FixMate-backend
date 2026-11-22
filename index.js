@@ -2321,6 +2321,155 @@ app.get(
   }
 );
 
+
+app.patch(
+  "/api/admin/bookings/:id/status",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { status, finalAmount } = req.body;
+
+      // 1. Validate booking ID
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid booking ID.",
+        });
+      }
+
+      // 2. Validate requested status
+      const allowedStatuses = [
+        "accepted",
+        "rejected",
+        "in-progress",
+        "completed",
+        "cancelled",
+      ];
+
+      if (!allowedStatuses.includes(status)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid booking status.",
+        });
+      }
+
+      // 3. Find existing booking
+      const booking = await serviceRequests.findOne({
+        _id: new ObjectId(id),
+      });
+
+      if (!booking) {
+        return res.status(404).json({
+          success: false,
+          message: "Booking not found.",
+        });
+      }
+
+      // 4. Prevent modifying paid bookings
+      if (booking.paymentStatus === "paid") {
+        return res.status(400).json({
+          success: false,
+          message: "Paid bookings cannot be modified.",
+        });
+      }
+
+      // 5. Validate status transitions
+      const allowedTransitions = {
+        requested: ["accepted", "rejected", "cancelled"],
+        accepted: ["in-progress", "cancelled"],
+        "in-progress": ["completed", "cancelled"],
+        completed: [],
+        rejected: [],
+        cancelled: [],
+      };
+
+      const currentStatus = booking.status;
+
+      if (
+        !allowedTransitions[currentStatus] ||
+        !allowedTransitions[currentStatus].includes(status)
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: `Cannot change booking from ${currentStatus} to ${status}.`,
+        });
+      }
+
+      // 6. Validate final repair amount
+      const updateData = {
+        status,
+        updatedAt: new Date(),
+      };
+
+      if (status === "completed") {
+        if (
+          typeof finalAmount !== "number" ||
+          !Number.isFinite(finalAmount) ||
+          finalAmount < 1 ||
+          Math.round(finalAmount * 100) / 100 !== finalAmount
+        ) {
+          return res.status(400).json({
+            success: false,
+            message:
+              "Final repair amount must be at least $1.00 USD with a maximum of 2 decimal places.",
+          });
+        }
+
+        if (booking.currency !== "USD") {
+          return res.status(400).json({
+            success: false,
+            message: "Only USD bookings can be completed.",
+          });
+        }
+
+        updateData.finalAmount = finalAmount;
+        updateData.paymentStatus = "unpaid";
+      }
+
+      // 7. Update booking
+      const result = await serviceRequests.updateOne(
+        {
+          _id: new ObjectId(id),
+          status: currentStatus,
+          paymentStatus: { $ne: "paid" },
+        },
+        {
+          $set: updateData,
+        }
+      );
+
+      if (result.modifiedCount === 0) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "Booking was modified by another request. Please refresh and try again.",
+        });
+      }
+
+      // 8. Return updated booking
+      const updatedBooking = await serviceRequests.findOne({
+        _id: new ObjectId(id),
+      });
+
+      return res.status(200).json({
+        success: true,
+        message: "Booking status updated successfully.",
+        data: updatedBooking,
+      });
+    } catch (error) {
+      console.error("Admin booking status update error:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Failed to update booking status.",
+      });
+    }
+  }
+);
+
+
 // Get all transactions for admin.
 app.get(
   "/api/admin/transactions",
